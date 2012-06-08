@@ -1,0 +1,1683 @@
+#!/bin/ksh
+# SVNID @(#)$Id: crayftn 1615 2012-04-13 15:17:16Z bam $
+#
+#       (C) COPYRIGHT CRAY INC.
+#       UNPUBLISHED PROPRIETARY INFORMATION.
+#       ALL RIGHTS RESERVED.
+#
+
+###
+# FTN_X86_64 is defined in modulefile cftn
+###
+
+eval ${SET-""}
+
+if [ "${ORIG_CMD_NAME}" = "" ] ; then
+        export ORIG_CMD_NAME=`basename $0`
+fi
+
+unset POSIXLY_CORRECT
+
+if [ ! ${FTN_X86_64+1} ] ; then
+   info "The cce compiler is not loaded." >&2
+fi
+
+errorexit() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+info() {
+    echo "INFO: $*" >&2
+}
+
+bits=64
+compiler=$XTPE_COMPILER
+target=$XTPE_OS_TARGET
+osver=`echo "$XTOS_VERSION" | cut -f1-2`
+newosver=`echo $osver | cut -d. -f1-2 | sed -e "s/\.//g"`
+
+##if osver and newosver are different, then we are dealing with a DEV version
+##and we'll call that version 9.0
+   if [ "$osver" == "$newosver" ] ; then
+       osver=9.0
+   fi
+osver=`echo $osver | cut -d. -f1-2 | sed -e "s/\.//g"`
+
+rpath_prefix="-Wl,-rpath="
+
+if [ ${XTPE_NETWORK_TARGET:+1} ] ; then
+        network=$XTPE_NETWORK_TARGET
+else
+        network="seastar"
+fi
+
+is_default64=
+if [ "$FTN_DEFAULT64" == "yes" ] ; then
+   is_default64="64"
+   is_default64_include="64"
+   default64_suffix="_default64"
+fi
+
+pelevelver=0
+if [ ${PE_LEVEL:+1} ] ; then
+   pelevelver=`echo $PE_LEVEL | cut -d. -f1-2 | sed -e "s/\.//g"`
+   minor_pelevelver=`echo $CRAY_FTN_VERSION | cut -d. -f1-3 | sed -e "s/\.//g"`
+   ###
+   # Because only 7.4 supports interlagos, libsci, petsc and tpsl must be built with it.
+   # Others use 7.3 (mpich, hdf5, netcdf) until 8.0 releases, then they go to 7.4
+   ###
+   gen_compiler_ver=73
+   libsci_gen_compiler_ver=73
+fi
+
+###
+# See if mpt is new_form
+###
+if [ ${MPT_VERSION:+1} ] ; then
+  mptver=`echo "$MPT_VERSION" | cut -c1,3`
+   if [ -d ${MPICHBASEDIR}/${XTPE_NETWORK_TARGET}/mpich2-cray/${gen_compiler_ver}/lib ] ; then
+       mpt_new_form="yes"
+   fi
+elif [ ${CRAY_MPICH2_VERSION:+1} ] ; then
+  mptver=`echo "$CRAY_MPICH2_VERSION" | cut -c1,3`
+   if [ -d ${CRAY_MPICH2_BASEDIR}/${XTPE_NETWORK_TARGET}/mpich2-cray/${gen_compiler_ver}/lib ] ; then
+       mpich2_new_form="yes"
+   fi
+fi
+
+libsciver=0
+if [ ${LIBSCI_VERSION:+1} ] ; then
+   libsciver=`echo $LIBSCI_VERSION | cut -d. -f1-3 | sed -e "s/\.//g"`
+
+      if [ ${LIBSCI_X86_64:+1} ] ; then
+         LIBSCI_BASE_DIR=${LIBSCI_X86_64}
+      fi
+
+   if [ -d $LIBSCI_BASE_DIR/cray/${libsci_gen_compiler_ver} ] ; then
+       libsci_new_form="yes"
+       if [ ! ${CRAY_CPU_TARGET:+1} ] ; then
+        export LIBSCI_CRAY_CPU_TARGET=istanbul
+        export CRAY_CPU_TARGET=istanbul
+        if [ ${XTPE_INFO_MESSAGE_ON:+1} ] ; then
+           info "WARNING: CRAY_CPU_TARGET is not set. libsci default=istanbul"
+        fi
+       elif [ "${CRAY_CPU_TARGET}" == "barcelona" ] || [ "${CRAY_CPU_TARGET}" == "shanghai" ] || [ "${CRAY_CPU_TARGET}" == "x86-64" ] ; then
+        export LIBSCI_CRAY_CPU_TARGET=istanbul
+        if [ ${XTPE_INFO_MESSAGE_ON:+1} ] ; then
+           info "WARNING: Libsci/$LIBSCI_VERSION does not support ${CRAY_CPU_TARGET}. libsci target set to istanbul."
+        fi
+       elif [ "${CRAY_CPU_TARGET}" == "sandybridge" ] && [ ! -d $LIBSCI_BASE_DIR/cray/74/sandybridge ] ; then
+        export LIBSCI_CRAY_CPU_TARGET=xeon
+       else
+        LIBSCI_CRAY_CPU_TARGET=$CRAY_CPU_TARGET
+       fi
+       if [ "$pelevelver" -lt 73 ] ; then
+         info "WARNING: xt-libsci/$LIBSCI_VERSION does not support cce/$PE_LEVEL versions." >&2
+       fi
+    else
+       libsciver=1044
+    fi
+fi
+
+###
+# Find the petsc version. There are changes in the superlu library versions for pre-3.2.
+# Set PETSC_CRAY_CPU_TARGET
+###
+petscver=0
+superluver=3.1
+if [ ${CRAY_PETSC_VERSION:+1} ] || [ ${CRAY_PETSC_COMPLEX_VERSION:+1} ] ; then
+   if [ ${CRAY_PETSC_COMPLEX_VERSION:+1} ] ; then
+      petscver=`echo $CRAY_PETSC_COMPLEX_VERSION | cut -d. -f1-3 | sed -e "s/\.//g"`
+   else
+      petscver=`echo $CRAY_PETSC_VERSION | cut -d. -f1-3 | sed -e "s/\.//g"`
+   fi
+   if [ "$petscver" -ge 3100 ] ; then
+      superluver="4.0"
+   else
+      superluver="3.1"
+   fi
+   if [ -d ${CRAY_PETSC_DIR}/CRAY/${CRAY_PETSC}/x86_64 ] ; then
+      petsc_new_form="yes"
+     if [ ! ${CRAY_CPU_TARGET:+1} ] ; then 
+        PETSC_CRAY_CPU_TARGET=x86_64
+        petsc_gen_compiler_ver=${CRAY_PETSC}
+        if [ ${XTPE_INFO_MESSAGE_ON:+1} ] ; then
+         info "WARNING: CRAY_CPU_TARGET is not set. petsc default=x86_64"
+        fi
+     elif [ "${CRAY_CPU_TARGET}" != "interlagos" ] ; then
+        PETSC_CRAY_CPU_TARGET=x86_64
+        petsc_gen_compiler_ver=${CRAY_PETSC}
+     else
+        PETSC_CRAY_CPU_TARGET=$CRAY_CPU_TARGET
+        if [ ${CRAY_PETSC_INTERLAGOS:+1} ] ; then
+          petsc_gen_compiler_ver=${CRAY_PETSC_INTERLAGOS}
+        else
+          petsc_gen_compiler_ver=${CRAY_PETSC}
+        fi
+     fi   
+   fi
+   if [ "$pelevelver" -lt 73 ] ; then
+      info "WARNING: petsc/$CRAY_PETSC_VERSION does not support cce/$PE_LEVEL versions." >&2
+   fi
+fi
+
+###
+# TPSL cpu target setup
+###
+
+tpslver=0
+if [ ${CRAY_TPSL_VERSION:+1} ] ; then
+   tpslver=`echo $CRAY_TPSL_VERSION | cut -d. -f1-3 | sed -e "s/\.//g"`
+
+   if [ ${TPSL_X86_64:+1} ] ; then
+      CRAY_TPSL_DIR=${TPSL_X86_64}
+      CRAY_SUNDIALS_VERSION=${SUNDIALS_X86_64_VERSION}
+   fi
+
+   if [ -d ${CRAY_TPSL_DIR}/CRAY/${CRAY_TPSL}/x86_64 ] ; then
+        tpsl_new_form="yes"
+     if [ ! ${CRAY_CPU_TARGET:+1} ] ; then
+        TPSL_CRAY_CPU_TARGET="x86_64"
+        tpsl_gen_compiler_ver=${CRAY_TPSL}
+        if [ ${XTPE_INFO_MESSAGE_ON:+1} ] ; then
+           info "WARNING: CRAY_CPU_TARGET is not set. tpsl target set to x86_64"
+        fi
+     elif [ "${CRAY_CPU_TARGET}" != "interlagos" ]  ; then
+        TPSL_CRAY_CPU_TARGET="x86_64"
+        tpsl_gen_compiler_ver=${CRAY_TPSL}
+        if [ ${XTPE_INFO_MESSAGE_ON:+1} ] ; then
+           info "WARNING: tpsl/$CRAY_TPSL_VERSION does not support $CRAY_CPU_TARGET. tpsl cpu target set to x86_64."
+        fi
+     else
+        TPSL_CRAY_CPU_TARGET=$CRAY_CPU_TARGET
+        if [ ${CRAY_TPSL_INTERLAGOS:+1} ] ; then
+            tpsl_gen_compiler_ver=${CRAY_TPSL_INTERLAGOS}
+        else
+            tpsl_gen_compiler_ver=${CRAY_TPSL}
+        fi
+     fi
+     if [ "$pelevelver" -lt 73 ] ; then
+        info "WARNING: tpsl/$CRAY_TPSL_VERSION does not support cce/$PE_LEVEL versions." >&2
+     fi
+
+   fi
+fi
+
+case $CRAY_CPU_TARGET in
+  barcelona)
+        compile_opts="-hcpu=barcelona"
+        cpu_suffix="_quadcore"
+  ;;
+  shanghai)
+        compile_opts="-hcpu=shanghai"
+        cpu_suffix="_quadcore"
+  ;;
+  istanbul)
+        compile_opts="-hcpu=istanbul"
+        cpu_suffix="_quadcore"
+  ;;
+  mc8)
+        compile_opts="-hcpu=mc8"
+        cpu_suffix="_quadcore"
+  ;;
+  mc12)
+        compile_opts="-hcpu=mc12"
+        cpu_suffix="_quadcore"
+  ;;
+  interlagos | interlagos-cu | abudhabi | abudhabi-cu)
+     if [ "$pelevelver" -le 73 ] ; then
+        errorexit "cce $PE_LEVEL does not support the $CRAY_CPU_TARGET target."
+     fi
+     if [ "$CRAY_INTERLAGOS_CU" == "yes" ] ; then
+        if [ "$minor_pelevelver" -lt 801 ] ; then
+           errorexit "cce $CRAY_FTN_VERSION does not support the interlagos-cu target."
+        else
+           compile_opts="-hcpu=interlagos-cu"
+        fi
+     elif [ "$CRAY_ABUDHABI" == "yes" ] ; then
+        if [ "$pelevelver" -lt 81 ] ; then
+           errorexit "cce $CRAY_FTN_VERSION does not support the abudhabi target."
+        else
+           compile_opts="-hcpu=abudhabi"
+        fi
+     elif [ "$CRAY_ABUDHABI_CU" == "yes" ] ; then
+        if [ "$pelevelver" -lt 81 ] ; then
+           errorexit "cce $CRAY_FTN_VERSION does not support the abudhabi-cu target."
+        else
+           compile_opts="-hcpu=abudhabi-cu"
+        fi
+     else
+           compile_opts="-hcpu=interlagos"
+     fi
+     libsci_gen_compiler_ver=74
+  ;;
+  xeon)
+        compile_opts="-hcpu=xeon"
+  ;;
+  sandybridge)
+        compile_opts="-hcpu=sandybridge"
+        if [ "$LIBSCI_CRAY_CPU_TARGET" == "sandybridge" ] ; then
+           libsci_gen_compiler_ver=74
+        fi
+  ;;
+  *)
+        compile_opts="-hcpu=x86-64"
+  ;;
+esac
+
+###
+# And now some special casing for tpsl 1.1.00 and petsc 3.1.08
+###     
+if [ "$petscver" -ge 3108 ] ; then
+   cpu_suffix="_quadcore"
+elif [ "$tpslver" -ge 1100 ] ; then
+   cpu_suffix="_quadcore"
+fi
+
+if [ "$bits" = 64 ] ; then
+    ARCH=amd64    
+    CFLAGS=
+    ASFLAGS=
+    LIBM=
+#    LIBM=-lm ##Let's remove this reference. The binary driver adds one.
+else
+    ARCH=i386
+    CFLAGS=-D__RS_DEV_IA32__
+    ASFLAGS=-D__RS_DEV_IA32__
+    LIBM=
+fi
+
+##
+# test to see which suse version. 0=no 1=yes
+# This test returns instances from grep
+##
+if [ -f /etc/SuSE-release ] ; then
+        is_it_suse10=`cat /etc/SuSE-release | grep -c "VERSION = 10"`
+        is_it_suse11=`cat /etc/SuSE-release | grep -c "VERSION = 11"`
+        is_it_suse11sp1=`cat /etc/SuSE-release | grep -c "VERSION = 11"`
+else
+        is_it_suse10="0"
+        is_it_suse11="0"
+fi
+
+##
+# PORTALS
+##
+if [ ${CRAY_PORTALS_POST_LINK_OPTS:+1} ] || [ ${PORTALS_POST_LINK_OPTS:+1} ] ; then
+        LIBPORTALS="-Wl,--as-needed -lportals -Wl,--no-as-needed"
+else
+        LIBPORTALS=
+        PORTALS_LDFLAGS=
+fi
+
+##########################
+# Environment variable PE_DIR should be set
+# This place is for various includes and libraries.
+# This is set by modulefile xt-pe. After 2.2* we don't need
+# xt-pe and PE_DIR.
+   if [ "$CRAYPE_COMPILE_TARGET" == "local_host" ] ; then
+      CNL_LIBS_DIR=
+      APP_LIBS_DIR=
+      APP_INCS_DIR=
+   elif [ ${PE_DIR:+1} ] ; then
+        APP_INCS_DIR=" -I$PE_DIR/include -I/opt/xt-pe/default/include"
+         if [ "$osver" -lt 21 ] ; then
+            CNL_LIBS_DIR=" -L${PE_DIR}/cnos/linux/64/lib"
+            APP_LIBS_DIR=" -L${PE_DIR}/lib/snos64"
+         elif [ "$osver" -lt 23 ] ; then
+            CNL_LIBS_DIR=" -L${PE_DIR}/lib -L/opt/xt-pe/default/lib -L${PE_DIR}/lib/snos64 \
+            -L/opt/xt-pe/default/lib/snos64 ${rpath_prefix}${PE_DIR}/lib ${rpath_prefix}/opt/xt-pe/default/lib"
+            APP_LIBS_DIR=
+            LIBPORTALS="-Wl,--as-needed -lportals -Wl,--no-as-needed"
+         fi
+   else
+      CNL_LIBS_DIR=
+      APP_LIBS_DIR=
+   fi
+
+##########################
+# Environment variable SE_DIR should be set
+# Grab libportals.a from here until 2.2+ when
+# we get it from xt-pe, until 2.3 when we don't need it.
+   if [ ${SE_DIR:+1} ] && [ "$osver" -le 21 ] ; then
+     SE_LIBS_DIR=" -L$SE_DIR/lib/snos$bits"
+   else
+     SE_LIBS_DIR=
+   fi
+
+FTN_X86_64=${FTN_X86_64:-/opt/cray/cce/default/cftn/x86-64}
+
+OS_TYPE=`echo $(uname -s)`
+
+export FTN_DRIVER=${FTN_DRIVER:-${FTN_X86_64}/bin/ftn_driver.exe}
+
+###
+# Setting CRAY_PRINT_TARGET causes -hprint_target to supply commandline 4 options.
+# Use this to allow user-supplied options to rule
+###
+if [ "$pelevelver" -ge 80 ] ; then
+   export CRAY_PRINT_TARGET2=1
+fi
+
+cray_target=$(COMPILER=x COMPILER_X2=x COMPILER_X86_64=x ASSEMBLER=x LOADER=x LOADER_X2=x LINKER_X86_64=x LISTER=/bin/true CRAYLIBS=x "$FTN_DRIVER" $compile_opts "$@" -hprint_target)
+status=$?
+if [ "$status" != 0 ] ; then
+  exit $status
+fi
+
+# Read in targeting information
+# We need to know if the user used the commandline to define targets.
+##
+
+case "$cray_target" in
+
+x86-64)
+  ;;
+
+x86-64:*)
+  option_list=`echo "$cray_target" | sed  -e "s/\:/ /g"`
+  cray_target=`echo $option_list | awk '{print $1}'`
+  cpu_target=`echo $option_list | awk '{print $2}'`
+#      if [ "$cpu_target" != "none" ] ; then
+#         CRAY_CPU_TARGET=$cpu_target
+#      fi
+  network_target=`echo $option_list | awk '{print $3}'`
+      if [ "$network_target" != "none" ] ; then
+         XTPE_NETWORK_TARGET=$network_target
+         network=$network_target
+      fi
+  accel_target=`echo $option_list | awk '{print $4}'`
+      if [ "$accel_target" != "none" ] ; then
+         CRAY_ACCEL_TARGET=$accel_target
+      fi
+  ;;
+*)
+
+esac
+
+##
+# For purposes of library linking, if target=aries, use target=gemini
+##
+
+  if [ "$XTPE_NETWORK_TARGET" == "aries" ] ; then
+     XTPE_NETWORK_TARGET=gemini
+     network=gemini
+  fi
+
+# Start this empty; we'll append options to it as we go.
+CMDOPTS=
+
+case "$cray_target" in
+
+cray-x2)
+   errorexit "cray-x2 is not a supported target in PrgEnv-cray. Please load PrgEnv-x2."
+   ;;
+
+x86-64)
+
+  # Look at accelerator target and add scilib references from cuda
+  cuda_libsci=  
+  if [ ${CRAY_ACCEL_TARGET:+1} ] ; then
+     if [ ${CRAY_CUDA_POST_LINK_OPTS:+1} ] || [ ${CRAY_CUDATOOLKIT_POST_LINK_OPTS:+1} ] ; then
+       cuda_libsci="-lcufft -lcublas"
+     fi
+  fi
+
+  case $CRAY_ACCEL_TARGET in
+  nvidia20 | nvidia_20)
+        export CRAY_ACCEL_TARGET=nvidia20
+        if [ ${CRAY_LIBSCI_ACC:+1} ] ; then
+           libsciacc_gen_compiler_ver=$CRAY_LIBSCI_ACC
+        else
+           libsciacc_gen_compiler_ver=80
+        fi
+  ;;
+  *)
+  ;;
+  esac
+
+  # Set up variables for the driver.
+  # Set up CRAYLIBS. For convenience if we don't have a special module providing
+  # an x86-64 craylibs path, use a default newest path.
+  export CRAYLIBS="${CRAYLIBS:-${CRAYLIBS_X86_64:-/opt/cray/cce/default/craylibs/x86-64}}"
+
+  # Set up the compiler executable path. Make way for the new name, cft90.
+  if [ -f ${FTN_X86_64}/lib/cft90 ] ; then
+     export COMPILER=${CFTN_X86_64:-${COMPILER_X86_64:-${FTN_X86_64}/lib/cft90}}
+  else
+     export COMPILER=${CFTN_X86_64:-${COMPILER_X86_64:-${FTN_X86_64}/lib/cft90_bw}}
+  fi
+
+  if [ -f ${FTN_X86_64}/lib/ftnfe ] ; then
+     export FTNFE=${FTNFE:-${FTN_X86_64}/lib/ftnfe}
+  fi
+
+  if [ -f ${FTN_X86_64}/lib/optcg ] ; then
+     export OPTCG_BE=${OPTCG_BE:-${FTN_X86_64}/lib/optcg}
+  fi
+
+   if [ -f ${CRAYLIBS_X86_64}/libalign.a ] ; then
+      aligndata_fix="-Wl,--whole-archive,-lalign,--no-whole-archive"
+   else
+      aligndata_fix=
+   fi
+
+  # establish gcc path - MUST BE ADDED LATER instead of hard-coded path
+  export GCC_X86_64="${GCC_X86_64:-/opt/gcc/4.1.2/snos}"
+
+  # Set up the linker path.
+  # ALT_LINKER is a workaround for sites that want to define an alternate linker. It requires a full path like /usr/bin/ld.
+  if [ ${ALT_LINKER:+1} ] ; then
+     export LINKER=$ALT_LINKER
+  else
+     export LINKER="${LINKER_X86_64:-/usr/bin/ld}"
+  fi
+
+  # Set up the STRIP path.
+  if [ -f ${CRAY_BINUTILS_BIN}/objcopy ] ; then
+    export STRIP="${CRAY_BINUTILS_BIN}/objcopy"
+  else
+    export STRIP="/usr/bin/objcopy"
+  fi
+
+  # Set up the assembler path.
+  export ASSEMBLER="${ASSEMBLER_X86_64:-/usr/bin/as}"
+
+  # Set the sysroot
+  if [ "${SYSROOT_X86_64}" != "" ] ; then
+    # If a sysroot is specified, use it. 
+    SYSROOT="-usysroot=$SYSROOT_X86_64"
+  elif [ $(uname -m) = "x86_64" ] ; then
+    # Otherwise, on 64-bit hosts we're a native compiler, so for convenience
+    # just use the native headers and libraries.
+  SYSROOT="-usysroot=/"
+  fi
+
+  INCDIRS=""
+
+  #######
+  # get lib load paths from user env
+  #######
+  ldpathlist="LIBRARY_PATH_X86_64"
+  eval ldpath='$'$ldpathlist
+  if [ -n "${ldpath}" ] ; then
+    ldpath=-L`echo $ldpath | sed "s/:/ -L/g"`
+    LIB_PATH="$ldpath"
+  else
+    LIB_PATH=
+  fi
+  ;;
+
+*) echo "Target $cray_target is not supported!!!" ; exit 1 ;;
+esac
+
+###
+#  get acml path
+#  5.0 is only compatible with 8.0 cce and beyond
+###
+acmlver=0
+if [ ${ACML_VERSION:+1} ] ; then
+   acmlver=`echo $ACML_VERSION | cut -d. -f1-2 | sed -e "s/\.//g"`
+   if [ "$FOPENMP_ENABLED" == "yes" ] ; then
+         fopenmp_acml_suffix="_mp"
+   else
+         fopenmp_acml_suffix=
+   fi
+   if [ "$CRAY_CPU_TARGET" == "interlagos" ] ; then
+          fma_acml_suffix="_fma4"
+   else
+          fma_acml_suffix=
+   fi
+
+   if [ "$acmlver" -ge 50 ] ; then
+      if [ "$pelevelver" -le 75 ] ; then
+         errorexit "acml/$ACML_VERSION is not compatible with cce/$PE_LEVEL. Swap to acml version 4.4.0 or less."
+      else
+         if [ "$XTPE_LINK_TYPE" == "dynamic" ]  && [ "$CRAY_ACML_USER" == "yes" ] ; then
+            if [ -f /opt/gcc/4.6.1/snos/lib64/libgfortran.so.3 ] ; then
+               ACML_LDFLAGS="-L${ACML_DIR}/gfortran64${fma_acml_suffix}${fopenmp_acml_suffix}/lib ${rpath_prefix}${ACML_DIR}/gfortran64${fma_acml_suffix}${fopenmp_acml_suffix}/lib"
+               ACML_INCFLAGS="-I${ACML_DIR}/gfortran64${fma_acml_suffix}${fopenmp_acml_suffix}/include"
+               LIBACML="-lacml${fopenmp_acml_suffix} -lgfortran -lrt"
+               CRAY_ACML_GCC_LD_FLAG="-Wl,/opt/gcc/4.6.1/snos/lib64/libgfortran.so.3"
+               CRAY_ACML_GCC_LD_PATH="-L/opt/gcc/4.6.1/snos/lib64 ${rpath_prefix}/opt/gcc/4.6.1/snos/lib64"
+            else
+               if [ ${XTPE_INFO_MESSAGE_ON:+1} ] ; then
+                 info WARNING: "gcc/4.6.1 is needed to support ACML/$ACML_VERSION, but is not installed."
+               fi
+               CRAY_ACML_GCC_LD_FLAG=
+               CRAY_ACML_GCC_LD_PATH=
+            fi
+
+         elif [ "$XTPE_LINK_TYPE" == "static" ] && [ "$CRAY_ACML_USER" == "yes" ] ; then
+            if [ -f /opt/gcc/4.6.1/snos/lib64/libgfortran.a ] ; then
+               ACML_LDFLAGS="-L${ACML_DIR}/gfortran64${fma_acml_suffix}${fopenmp_acml_suffix}/lib"
+               ACML_INCFLAGS="-I${ACML_DIR}/gfortran64${fma_acml_suffix}${fopenmp_acml_suffix}/include"
+               LIBACML="-lacml${fopenmp_acml_suffix} -lgfortran -lrt"
+               CRAY_ACML_GCC_LD_FLAG="-Wl,/opt/gcc/4.6.1/snos/lib64/libgfortran.a"
+               CRAY_ACML_GCC_LD_PATH="-L/opt/gcc/4.6.1/snos/lib64"
+            else
+               if [ ${XTPE_INFO_MESSAGE_ON:+1} ] ; then
+                 info WARNING: "gcc/4.6.1 is needed to support ACML/$ACML_VERSION, but is not installed."
+               fi
+               CRAY_ACML_GCC_LD_FLAG=
+               CRAY_ACML_GCC_LD_PATH=
+            fi
+         fi
+      fi
+   else
+
+      if [ ${CRAY_ACML_GCC_LD_FLAG:+1} ] ; then
+         CRAY_ACML_GCC_LD_FLAG="-L${CRAY_ACML_GCC_LD_FLAG}"
+         CRAY_ACML_GCC_LD_PATH=
+      elif [ -f /opt/gcc/4.4.4/snos/lib64/libgfortran.so.3 ] && [ "$XTPE_LINK_TYPE" == "dynamic" ] ; then
+         CRAY_ACML_GCC_LD_FLAG="-Wl,/opt/gcc/4.4.4/snos/lib64/libgfortran.so.3"
+         CRAY_ACML_GCC_LD_PATH="${rpath_prefix}/opt/gcc/4.4.4/snos/lib64"
+      else
+         CRAY_ACML_GCC_LD_FLAG=
+         CRAY_ACML_GCC_LD_PATH=
+      fi
+
+      if [ "$CRAY_SHARED" == "yes" ] ; then
+         CMDOPTS="${CMDOPTS} ${aligndata_fix} \
+         -L${ACML_DIR}/gfortran64/lib ${rpath_prefix}${ACML_DIR}/gfortran64/lib \
+         -I${ACML_DIR}/gfortran64/include"
+      elif [ "${ACML_DIR}" != "" ] ; then
+         CMDOPTS="${CMDOPTS} ${aligndata_fix} \
+         -L${ACML_DIR}/gfortran64/lib ${rpath_prefix}${ACML_DIR}/gfortran64/lib \
+         -lcraymath -lgfortran -lrt -I${ACML_DIR}/gfortran64/include"
+      fi
+   fi
+else
+        ACML_LDFLAGS=
+        ACML_INCFLAGS=
+        ACML_RPATHFLAGS=
+        CRAY_ACML_GCC_LD_FLAG=
+        CRAY_ACML_GCC_LD_PATH=
+
+fi
+
+###
+# Process fftw anew: the 3.3 version is in "new" format
+###
+if [ ${FFTW_DIR:+1} ] || [ ${CRAY_FFTW_DIR:+1} ] ; then
+
+   if [ -d ${CRAY_FFTW_DIR}/interlagos/lib ] ; then
+
+      if [ "${CRAY_CPU_TARGET}" == "interlagos" ] ; then
+         FFTW_LDFLAGS="-L${CRAY_FFTW_DIR}/${CRAY_CPU_TARGET}/lib"
+         FFTW_INCFLAGS="-I${CRAY_FFTW_DIR}/${CRAY_CPU_TARGET}/include"
+         FFTW_RPATHFLAGS="${rpath_prefix}${CRAY_FFTW_DIR}/${CRAY_CPU_TARGET}/lib"
+      else
+         FFTW_LDFLAGS="-L${CRAY_FFTW_DIR}/x86_64/lib"
+         FFTW_INCFLAGS="-I${CRAY_FFTW_DIR}/x86_64/include"
+      fi
+      LIBFFTW="-lfftw3 -lfftw3f"
+      fftw_new_form=yes
+####
+# Process fftw 3.1.1 because libsci 10.3.0 depends on it.
+# See if fftw is version 3 and then set FFTW_SYSTEM_WISDOM_DIR
+# Also, for libsci 10.3.0, fftw library reference must be after -lsci
+
+   elif [ -z "$FFTW_POST_LINK_OPTS" ] ; then
+      LIBFFTW=""
+   else
+     if [ ${FFTW_VERSION:-0} ] ; then
+       fftw_version_check=`echo $FFTW_VERSION | cut -c1`
+     fi
+     if [ "$fftw_version_check" == "3" ] ; then
+         LIBFFTW="-lfftw3 -lfftw3f"
+     else
+         LIBFFTW=""
+     fi
+   fi
+else
+       LIBFFTW=
+       FFTW_LDFLAGS=
+       FFTW_INCFLAGS=
+fi
+
+###
+# get libsci path
+###
+
+###
+# Because of the default64 libraries and includes, we have to handle this in the cray driver
+# and not in linux*
+###
+if [ ${LIBSCI_BASE_DIR:+1} ] ; then
+   if [ "$CRAY_SHARED" == "yes" ] || [ "$CRAYPE_COMPILE_TARGET" == "native" ] ; then
+        LIBSCI=
+        LIBSCI_POST_LINK_OPTS=
+   elif [ "${LIBSCI_BASE_DIR}" != "" ] ; then
+
+#    We need to add fftw libs for dynamic xt-libsci libs and crafft.
+     if [ "$XTPE_LINK_TYPE" = "static" ] || [ ${LIBFFTW:+1} ] ; then
+        FFTW_PATH=
+     elif [ -d /opt/fftw/default/interlagos/lib ] ; then
+           if [ "$CRAY_CPU_TARGET" == "interlagos" ] ; then
+               FFTW_LDFLAGS="-L/opt/fftw/default/interlagos/lib"
+               FFTW_RPATHFLAGS="${rpath_prefix}/opt/fftw/default/interlagos/lib"
+           else
+               FFTW_LDFLAGS="-L/opt/fftw/default/x86_64/lib"
+               FFTW_RPATHFLAGS="${rpath_prefix}/opt/fftw/default/x86_64/lib"
+           fi
+           LIBFFTW="-lfftw3 -lfftw3f"
+           FFTW_PATH=
+     elif [ ${CRAY_LIBSCI_FFTW_PATH:+1} ] ; then
+        LIBFFTW="-lfftw3 -lfftw3f"
+        FFTW_PATH="-L${CRAY_LIBSCI_FFTW_PATH} ${rpath_prefix}${CRAY_LIBSCI_FFTW_PATH}" 
+        FFTW_RPATHFLAGS="${rpath_prefix}${CRAY_LIBSCI_FFTW_PATH}"
+     elif [ -f /opt/fftw/default/lib/libfftw3.so ] || [ -f /opt/fftw/default/cnos/lib/libfftw3.so ] ; then
+        LIBFFTW="-lfftw3 -lfftw3f"
+        FFTW_PATH="-L/opt/fftw/default/lib -L/opt/fftw/default/cnos/lib ${rpath_prefix}/opt/fftw/default/lib ${rpath_prefix}/opt/fftw/default/cnos/lib"
+     else
+        FFTW_PATH=
+     fi
+
+     if [ "$libsci_new_form" == "yes" ] ; then
+        LIBSCI="-lscicpp_cray -lsci_cray_mp $cuda_libsci"
+     else
+
+       ###
+       # setup for new library: libscicpp
+       # At 10.5.1 libsci, we introduct libscicpp.a and need to add it, but just when it exists.
+       ###
+       if [ -f $LIBSCI_BASE_DIR/cray/lib/libscicpp.a ] ; then
+          libscicpp="-lscicpp"
+       else
+          libscicpp=
+       fi
+
+       case $CRAY_CPU_TARGET in
+       interlagos)
+           LIBSCI="$libscicpp -lsci_mc12_mp $cuda_libsci"
+       ;;
+       mc12 | mc8)
+            LIBSCI="$libscicpp -lsci_mc12_mp $cuda_libsci"
+       ;;
+       istanbul)
+            LIBSCI="$libscicpp -lsci_istanbul_mp $cuda_libsci"
+       ;;
+       shanghai | barcelona)
+            LIBSCI="$libscicpp -lsci_quadcore_mp $cuda_libsci"
+       ;;
+       xeon | sandybridge)
+            if [ -d ${LIBSCI_BASE_DIR}/cray/xeon ] ; then
+               xeon_dir="xeon/"
+               LIBSCI="$libscicpp -lsci $cuda_libsci"
+            else
+               xeon_dir=
+               info "WARNING: xt-libsci/$LIBSCI_VERSION does not support xeon/sandybridge target." >&2
+               LIBSCI="$libscicpp -lsci"
+            fi
+       ;;
+       *)
+            LIBSCI="$libscicpp -lsci $cuda_libsci"
+       ;;
+       esac
+
+       if [ ! -f ${LIBSCI_BASE_DIR}/cray/lib/libsci_quadcore_mp.a ] ; then
+             unset CRAY_POST_COMPILE_OPTS
+       fi
+    fi
+
+    if [ "$libsci_new_form" == "yes" ] ; then
+
+     SCI_LDFLAGS="-L${LIBSCI_BASE_DIR}/cray/${libsci_gen_compiler_ver}/${LIBSCI_CRAY_CPU_TARGET}/lib $FFTW_PATH"
+     SCI_INCFLAGS="-I${LIBSCI_BASE_DIR}/cray/${libsci_gen_compiler_ver}/${LIBSCI_CRAY_CPU_TARGET}/include"
+     SCI_RPATHFLAGS="${rpath_prefix}${LIBSCI_BASE_DIR}/cray/${libsci_gen_compiler_ver}/${LIBSCI_CRAY_CPU_TARGET}/lib $FFTW_RPATHFLAGS"
+     libsci_fmodules_dir="${LIBSCI_BASE_DIR}/cray/${libsci_gen_compiler_ver}/${LIBSCI_CRAY_CPU_TARGET}/include"
+
+    else
+
+    ###
+    # Adjust the libsci path for 7.2 versus 7.3 compilers. 7.3 only supports libsci 10.4.4 and none previous.
+    ###
+
+       if [ "${libsciver}" -ge 1044 ] ; then
+          if [ "$pelevelver" -ge 73 ] ; then
+              SCI_LDFLAGS=" -L${LIBSCI_BASE_DIR}/cray/${xeon_dir}lib ${rpath_prefix}${LIBSCI_BASE_DIR}/cray/${xeon_dir}lib \
+              ${rpath_prefix}/opt/xt-libsci/default/cray/${xeon_dir}lib $FFTW_PATH"
+              SCI_INCFLAGS="-I${LIBSCI_BASE_DIR}/cray/${xeon_dir}include"
+## We don't have special xeon fortran modules : libsci_fmodules_dir=${LIBSCI_BASE_DIR}/cray/${xeon_dir}lib
+             libsci_fmodules_dir=${LIBSCI_BASE_DIR}/cray/lib
+          else
+              SCI_LDFLAGS="-L${LIBSCI_BASE_DIR}/cray/${xeon_dir}lib/72 ${rpath_prefix}${LIBSCI_BASE_DIR}/cray/${xeon_dir}lib/72 \
+              ${rpath_prefix}/opt/xt-libsci/default/cray/${xeon_dir}lib/72 $FFTW_PATH"
+              SCI_INCFLAGS="-I${LIBSCI_BASE_DIR}/cray/${xeon_dir}include"
+              libsci_fmodules_dir=${LIBSCI_BASE_DIR}/cray/lib/72
+          fi
+       else
+          if [ "$pelevelver" -ge 73 ] ; then
+               errorexit "cce $CRAY_FTN_VERSION does not support xt-libsci/$LIBSCI_VERSION  Swap to a 10.4.4+ xt-libsci."
+          else
+              if [ "$XTPE_XEON_ENABLED" == "ON" ] ; then
+                  info "WARNING: xt-libsci/$LIBSCI_VERSION does not support xeon target. Swap to a 10.4.4+ xt-libsci."
+              fi
+             SCI_LDFLAGS="-L${LIBSCI_BASE_DIR}/cray/lib ${rpath_prefix}${LIBSCI_BASE_DIR}/cray/lib \
+             ${rpath_prefix}/opt/xt-libsci/default/cray/lib $FFTW_PATH"
+             SCI_INCFLAGS="-I${LIBSCI_BASE_DIR}/cray/include -I$LIBSCI_BASE_DIR/cray/include/superlu"
+             libsci_fmodules_dir=${LIBSCI_BASE_DIR}/cray/lib
+          fi
+       fi
+    fi
+  fi
+else
+   LIBSCI=
+   SCI_LDFLAGS=
+   SCI_INCFLAGS=
+fi
+
+###
+# If libsci_acc, add library name to list. libsci_acc must precede libsci.
+###
+
+if [ ${LIBSCI_ACC_BASE_DIR:+1} ] && [ ${LIBSCI:+1} ] ; then
+
+   if [ -d ${LIBSCI_ACC_BASE_DIR}/cray/${libsciacc_gen_compiler_ver}/interlagos/lib ] ; then
+      case $CRAY_CPU_TARGET in
+      barcelona | shanghai | istanbul | x86-64 )
+        if [ ${XTPE_INFO_MESSAGE_ON:+1} ] ; then
+           info "WARNING: libsci_acc/$LIBSCI_ACC_VERSION does not support $CRAY_CPU_TARGET target."
+        fi
+      ;;
+      *)
+        LIBSCI_ACC_LDFLAGS="-L${LIBSCI_ACC_BASE_DIR}/cray/${libsciacc_gen_compiler_ver}/${CRAY_CPU_TARGET}/lib"
+        LIBSCI_ACC_RPATHFLAGS="${rpath_prefix}${LIBSCI_ACC_BASE_DIR}/cray/${libsciacc_gen_compiler_ver}/${CRAY_CPU_TARGET}/lib"
+        LIBSCI_ACC_INCFLAGS="-I${LIBSCI_ACC_BASE_DIR}/cray/${libsciacc_gen_compiler_ver}/${CRAY_CPU_TARGET}/include"
+        LIBSCI_ACC="-lsci_acc_$compiler"
+      ;;
+      esac
+   else
+      LIBSCI_ACC="-lsci_acc"
+      LIBSCI_ACC_LDFLAGS=
+      LIBSCI_ACC_RPATHFLAGS=
+      LIBSCI_ACC_INCFLAGS=
+   fi
+else
+   LIBSCI_ACC=
+   LIBSCI_ACC_INCFLAGS=
+   LIBSCI_ACC_LDFLAGS=
+   LIBSCI_ACC_RPATHFLAGS=
+fi
+
+##
+# alps when xt-mpt/4.0+ is loaded or no mpt is loaded
+# alps is special because it has no module
+# For xt-mpt 3.* and previous alps is in /util directory of mpt
+## 
+if [ $osver -lt 23 ] ; then
+   ALPS_LDFLAGS="-L/usr/lib/alps ${rpath_prefix}/usr/lib/alps"
+   ALPS_INCFLAGS="-I/usr/include/alps"
+   LIBALPS="-lalpslli -lalpsutil"
+else
+   ALPS_LDFLAGS="-L/usr/lib/alps"
+   ALPS_RPATHFLAGS="${rpath_prefix}/usr/lib/alps"
+   ALPS_INCFLAGS="-I/usr/include/alps"
+   LIBALPS="-Wl,--as-needed -lalpslli -lalpsutil -Wl,--no-as-needed"
+fi
+
+###
+# get mpt paths
+# In cray-x86 we need xt-mpt because it contains libpmi.a, libsma.a and libalps.a
+###
+
+if [ ${MPT_VERSION:+1} ] ; then
+
+###
+# When checkpoint/restart is loaded and network=gemini, try to bring in the special mpich library. Right now there's only a pgi version
+# so check for its existence and assume that if it exists and blcr is loaded, we'll use it.
+# Decide if we add the suffix, "_cpr" to the mpich libraries.
+# In mpich2 5.4, the *_cpr lib gets integrated into the libmpich and disappears.
+###
+
+   if [ "${XTPE_NETWORK_TARGET}" == "gemini" ] && [ ${BLCR_POST_LINK_OPTS:+1} ] ; then      
+      if [ -f ${MPT_DIR}/mpich2-cray/lib/libmpichf90_cpr.a ] || [ -f ${CRAY_MPICH2_ROOTDIR}/${network}/mpich2-cray/73/lib/libmpichf90_cray_cpr.a ] ; then
+          cpr_suffix="_cpr"
+      else
+         cpr_suffix=
+      fi
+   fi
+
+   if  [ "$mpt_new_form" == "yes" ] ; then
+       MPT_LDFLAGS="-L${MPICHBASEDIR}/${network}/mpich2-${compiler}${is_default64}/${gen_compiler_ver}/lib"
+       MPT_INCFLAGS="-I${MPICHBASEDIR}/${network}/mpich2-${compiler}${is_default64}/${gen_compiler_ver}/include"
+       mpt_fmodules_dir="${MPICHBASEDIR}/${network}/mpich2-${compiler}${is_default64}/${gen_compiler_ver}/include"
+       MPT_RPATHFLAGS="${rpath_prefix}${MPICHBASEDIR}/${network}/mpich2-${compiler}${is_default64}/${gen_compiler_ver}/lib"
+       LIBMPT="-lmpichf90_${compiler}${default64_suffix}${cpr_suffix} -lmpich_${compiler}${default64_suffix}${cpr_suffix} -lmpl -lrt"
+       SMA_LDFLAGS="-L${MPICHBASEDIR}/${network}/sma${is_default64}/lib64"
+       SMA_INCFLAGS="-I${MPICHBASEDIR}/${network}/sma${is_default64}/include"
+       SMA_RPATHFLAGS="${rpath_prefix}${MPICHBASEDIR}/${network}/sma${is_default64}/lib64"
+       LIBSMA="-lsma${default64_suffix}"
+
+   elif [ "${network}" == "gemini" ]  ; then
+
+         if [ "$mptver" -lt 50 ] ; then
+           errorexit "$MPT_VERSION does not support ${network}. Swap to a 5.0+ xt-mpt version."
+         elif [ "${XTPE_LINK_TYPE}" == "dynamic" ] ; then
+           echo "ERROR:Module xt-mpt is deprecated. Dynamic linking with xt-mpt libraries results in runtime errors."
+           echo "ERROR:Swap xt-mpt to xt-mpich2 or xt-shmem; or unload xt-mpt for programs not using MPI or SHMEM."
+           echo "ERROR:     module swap xt-mpt xt-mpich2   or   module swap xt-mpt xt-shmem   "
+           errorexit "Read the "mpi" man page for detailed user information."
+         else
+           MPT_LDFLAGS="-L${MPT_DIR}/mpich2-cray/lib ${rpath_prefix}${MPT_DIR}/mpich2-cray/lib  \
+           -L${MPT_DIR}/sma/lib64 ${rpath_prefix}${MPT_DIR}/sma/lib64"
+           MPT_INCFLAGS="-I${MPT_DIR}/mpich2-cray/include -I${MPT_DIR}/sma/include"
+
+           if [ -f ${MPT_DIR}/mpich2-$compiler/lib/libmpl.a ] ; then
+             LIBMPT="-lmpichf90${default64_suffix} -lmpich${default64_suffix} -lmpl -lrt"
+           else
+             LIBMPT="-lmpichf90${default64_suffix} -lmpich${default64_suffix} -lrt"
+           fi
+
+           LIBSMA="-lsma"
+
+         fi
+
+##
+# seastar - mpt
+##
+
+  elif [ "$mptver" -ge 40 ] ; then
+        MPT_LDFLAGS="-L${MPT_DIR}/mpich2-cray${is_default64}/lib ${rpath_prefix}${MPT_DIR}/mpich2-cray${is_default64}/lib  \
+        -L${MPICHBASEDIR}/sma${is_default64}/lib ${rpath_prefix}${MPT_DIR}/sma${is_default64}/lib"
+        MPT_INCFLAGS="-I${MPT_DIR}/mpich2-cray/include -I${MPICHBASEDIR}/sma${is_default64}/include"
+        mpt_fmodules_dir="${MPT_DIR}/mpich2-cray${is_default64}/include"
+
+        if [ "$mptver" -ge 50 ] ; then
+           MPT_LDFLAGS="-L${MPT_DIR}/mpich2-cray${is_default64}/lib ${rpath_prefix}${MPT_DIR}/mpich2-cray${is_default64}/lib  \
+           -L${MPT_DIR}/sma${is_default64}/lib64 ${rpath_prefix}${MPT_DIR}/sma${is_default64}/lib64"
+           MPT_INCFLAGS="-I${MPT_DIR}/mpich2-cray${is_default64}/include -I${MPT_DIR}/sma${is_default64}/include"
+           mpt_fmodules_dir="${MPT_DIR}/mpich2-cray${is_default64}/include"
+        fi
+
+        if [ -f ${MPT_DIR}/mpich2-$compiler${is_default64}/lib/libmpl.a ] ; then
+           LIBMPT="-lmpichf90 -lmpich -lmpl -lrt"
+        else
+           LIBMPT="-lmpichf90 -lmpich -lrt"
+        fi
+
+        LIBSMA="-lsma"
+
+  else
+
+        MPT_LDFLAGS="-L${MPT_DIR}/mpich2-cray/lib ${rpath_prefix}${MPT_DIR}/mpich2-cray/lib"
+        MPT_INCFLAGS="-I${MPT_DIR}/mpich2-cray/include"
+        LIBMPT="-lmpichf90 -lmpich -lrt"
+        LIBPMI="-lpmi"
+        LIBALPS="-lalpslli -lalpsutil"
+        LIBSMA="-lsma"
+        PMI_LDFLAGS=" -L$MPT_DIR/pmi/lib ${rpath_prefix}$MPT_DIR/pmi/lib"
+        PMI_INCFLAGS=" -I$MPT_DIR/pmi/include"
+        ALPS_LDFLAGS=" -L$MPT_DIR/util/lib ${rpath_prefix}$MPT_DIR/util/lib"
+        SMA_LDFLAGS="-L$MPT_DIR/sma/lib ${rpath_prefix}$MPT_DIR/sma/lib"
+        SMA_INCFLAGS="-I$MPT_DIR/sma/include"
+
+  fi
+
+else
+
+LIBSMA=
+SMA_LDFLAGS=
+SMA_INCFLAGS=
+LIBMPT=
+MPT_LDFLAGS=
+MPT_RPATHFLAGS=
+MPT_INCFLAGS=
+
+fi
+
+###
+# remove cnl-libs list if target=native
+###
+if [ "$CRAYPE_COMPILE_TARGET" == "native" ] || [ "$CRAY_SHARED" == "yes" ] ; then
+   CNL_LIBS_LIST=
+   MPT_INCFLAGS=
+   MPT_LDFLAGS=
+fi
+
+# Get sysroot directory for correct SuSE version
+
+if [ "$SYSROOT_DIR" == "" ] || [ "$CRAYPE_COMPILE_TARGET" != "compute_node" ] || [ "$CRAY_SHARED" == "yes" ] ; then
+    SYSROOT_LIBS_PATH=
+    SYSROOT_INC_PATH=
+elif [ "$CRAYPE_COMPILE_TARGET" == "compute_node" ] ; then
+    SYSROOT_INC_PATH="-I${SYSROOT_DIR}/usr/include"
+    SYSROOT_LIBS_PATH=" -L${SYSROOT_DIR}/usr/lib64 -L${SYSROOT_DIR}/lib64 -L${SYSROOT_DIR}/usr/lib/alps"
+fi
+
+###
+# get gcc library path
+# When acml/5.0 is loaded and CRAY_ACML_USER=yes, we use a different gcc path to find gfortran.so.3.
+# acml/4.4 uses the generic 4.4.4 path.
+###
+
+   CMDOPTS="${CMDOPTS} ${CRAY_ACML_GCC_LD_FLAG} ${CRAY_ACML_GCC_LD_PATH} -L${GCC_X86_64}/lib64 ${rpath_prefix}${GCC_X86_64}/lib64"
+
+  ########
+  # get include paths from user env
+  ########
+  incpathlist="INCLUDE_PATH_X86_64"
+  eval incpath='$'$incpathlist
+  if [ -n "${incpath}" ] ; then
+    INC_PATH=-I`echo $incpath | sed "s/:/ -I/g"`
+  else
+    INC_PATH=
+  fi
+
+  ####
+  # Set options for linker
+  ####
+
+  # Set the GCC installation base
+  if [ "${GCC_X86_64}" != "" ] ; then
+    GCC_BASE="-ugcc_base=$GCC_X86_64"
+  fi
+
+###
+# SHMEM setup
+###
+
+if [ ${CRAY_SHMEM_ROOTDIR:+1} ] ; then
+    if [ -f $CRAY_SHMEM_ROOTDIR/$network/sma64/lib64/libsma_default64.a ] ; then
+       SHMEM_LDFLAGS="-L$CRAY_SHMEM_ROOTDIR/$network/sma${is_default64}/lib64"
+       SHMEM_RPATHFLAGS="${rpath_prefix}$CRAY_SHMEM_ROOTDIR/$network/sma${is_default64}/lib64"
+       SHMEM_INCFLAGS="-I$CRAY_SHMEM_ROOTDIR/$network/sma${is_default64}/include"
+       LIBSHMEM="-lsma${default64_suffix}"
+    else
+       SHMEM_LDFLAGS="-L${CRAY_SHMEM_DIR}${is_default64}/lib64 ${rpath_prefix}$CRAY_SHMEM_DIR/lib64"
+       SHMEM_INCFLAGS="-I$CRAY_SHMEM_DIR/${is_default64}include"
+       LIBSHMEM="-lsma"
+    fi
+else
+    SHMEM_LDFLAGS=
+    SHMEM_RPATHFLAGS=
+    SHMEM_INCFLAGS=
+    LIBSHMEM=
+fi
+
+###
+# MPICH2 setup
+###
+
+if [ ${CRAY_MPICH2_ROOTDIR:+1} ] ; then
+
+     if [ "$mptver" -ge 54 ] && [ "$XTPE_NETWORK_TARGET" == "seastar" ] ; then
+        if [ ${XTPE_INFO_MESSAGE_ON:+1} ] ; then
+           info WARNING: "xt-mpich2/$CRAY_MPICH2_VERSION does not support seastar; change network target or swap to older xt-mpich2 version."
+        fi
+     fi
+
+     if [ -d ${CRAY_MPICH2_ROOTDIR}/${network}/mpich2-cray${is_default64}/$gen_compiler_ver/lib ] ; then
+        MPICH2_LDFLAGS="-L${CRAY_MPICH2_ROOTDIR}/${network}/mpich2-cray${is_default64}/${gen_compiler_ver}/lib"
+        MPICH2_RPATHFLAGS="${rpath_prefix}${CRAY_MPICH2_ROOTDIR}/${network}/mpich2-cray${is_default64}/${gen_compiler_ver}/lib"
+        MPICH2_INCFLAGS="-I${CRAY_MPICH2_ROOTDIR}/${network}/mpich2-cray${is_default64}/${gen_compiler_ver}/include"
+        mpich2_fmodules_dir="${CRAY_MPICH2_ROOTDIR}/${network}/mpich2-cray${is_default64}/${gen_compiler_ver}/include"
+        if  [ ${BLCR_POST_LINK_OPTS:+1} ] && [ -f ${CRAY_MPICH2_ROOTDIR}/${network}/mpich2-cray/73/lib/libmpich_cray_cpr.a ] ; then
+             cpr_suffix="_cpr"
+        else
+             cpr_suffix=
+        fi
+        LIBMPICH2="-lmpichf90_cray${default64_suffix}${cpr_suffix} -lmpich_cray${default64_suffix}${cpr_suffix} -lmpl"
+     else
+        if  [ ${BLCR_POST_LINK_OPTS:+1} ] && [ -f ${CRAY_MPICH2_ROOTDIR}/${network}/mpich2-cray/lib/libmpich_cpr.a ] ; then
+             cpr_suffix="_cpr"
+        else
+             cpr_suffix=
+        fi
+        if [ -f ${CRAY_MPICH2_ROOTDIR}/${network}/mpich2-cray/lib/libmpichf90_default64.a ] && [ "$FTN_DEFAULT64" == "yes" ] ; then
+          default64_suffix="_default64"
+        else
+          default64_suffix=
+        fi
+        MPICH2_LDFLAGS="-L${CRAY_MPICH2_ROOTDIR}/${network}/mpich2-cray${is_default64}/lib \
+            ${rpath_prefix}${CRAY_MPICH2_ROOTDIR}/${network}/mpich2-cray${is_default64}/lib"
+        MPICH2_INCFLAGS="-I${CRAY_MPICH2_ROOTDIR}/${network}/mpich2-cray${is_default64}/include"
+        if [ -f ${CRAY_MPICH2_ROOTDIR}/${network}/mpich2-cray${is_default64}/lib/libmpl.a ] ; then
+            LIBMPICH2="-lmpichf90${default64_suffix}${cpr_suffix} -lmpich${default64_suffix}${cpr_suffix} -lmpl"
+        else
+            LIBMPICH2="-lmpichf90${default64_suffix}${cpr_suffix} -lmpich${default64_suffix}${cpr_suffix}"
+        fi
+     fi
+else
+    MPICH2_LDFLAGS=
+    MPICH2_RPATHFLAGS=
+    MPICH2_INCFLAGS=
+    LIBMPICH2=
+fi
+
+###
+# Allow MPICH2 third party (CPE_MPICH2) to replace CRAY_MPICH2 for certain apps
+###
+
+if [ ${CPE_MPICH2_DIR:+1} ] ; then
+   MPT_LDFLAGS=
+   MPT_INCFLAGS=
+   LIBMPT=
+# The following removes alps from the link list for gpu apps
+   LIBALPS=
+   ALPS_LDFLAGS=
+   ALPS_INCFLAGS=
+   MPICH2_LDFLAGS=
+   MPICH2_INCFLAGS=
+   cpe_fmodules_dir=${CPE_MPICH2_DIR}/include
+   if [ -f ${CPE_MPICH2_DIR}/lib/libmpl.a ] ; then
+           LIBMPICH2="-lmpichf90 -lmpich -lmpl -lrt"
+   else
+           LIBMPICH2="-lmpichf90 -lmpich -lrt"
+   fi
+fi
+
+####
+# Process -lscifft if LIBSCIFFT_DIR is set, probably from modulefile libscifft.
+##libscifft doesn't support cray
+
+###
+# TPSL product setup
+###
+
+if [ ${CRAY_TPSL_DIR:+1} ] ; then
+
+   if [ "$tpsl_new_form" == "yes" ] ; then
+
+      TPSL_LDFLAGS="-L${CRAY_TPSL_DIR}/${PE_ENV}/${tpsl_gen_compiler_ver}/${TPSL_CRAY_CPU_TARGET}/lib"
+      TPSL_INCFLAGS="-I${CRAY_TPSL_DIR}/${PE_ENV}/${tpsl_gen_compiler_ver}/${TPSL_CRAY_CPU_TARGET}/include"
+      TPSL_RPATHFLAGS="${rpath_prefix}${CRAY_TPSL_DIR}/${PE_ENV}/${tpsl_gen_compiler_ver}/${TPSL_CRAY_CPU_TARGET}/lib"
+   elif [ ${pelevelver} -le 72 ] ; then
+      TPSL_LDFLAGS="-L${CRAY_TPSL_DIR}/${PE_ENV}/sundials-${CRAY_SUNDIALS_VERSION}/lib/72 \
+      -L${CRAY_TPSL_DIR}/${PE_ENV}/lib/72 ${rpath_prefix}${CRAY_TPSL_DIR}/${PE_ENV}/lib/72 \
+      ${rpath_prefix}${CRAY_TPSL_DIR}/${PE_ENV}/sundials-${CRAY_SUNDIALS_VERSION}/lib/72"
+      TPSL_INCFLAGS="-I${CRAY_TPSL_DIR}/${PE_ENV}/sundials-${CRAY_SUNDIALS_VERSION}/include/72 \
+      -I${CRAY_TPSL_DIR}/${PE_ENV}/include/72"
+      export CRAY_SUNDIALS_INCLUDE_DIR="${CRAY_TPSL_DIR}/${PE_ENV}/sundials-${CRAY_SUNDIALS_VERSION}/include/72"
+   elif [ -d ${CRAY_TPSL_DIR}/$PE_ENV}/lib/${pelevelver} ] ; then
+      TPSL_LDFLAGS="-L${CRAY_TPSL_DIR}/${PE_ENV}/sundials-${CRAY_SUNDIALS_VERSION}/lib/${pelevelver} \
+      -L${CRAY_TPSL_DIR}/${PE_ENV}/lib/${pelevelver} ${rpath_prefix}${CRAY_TPSL_DIR}/${PE_ENV}/lib/${pelevelver} \
+      ${rpath_prefix}${CRAY_TPSL_DIR}/${PE_ENV}/sundials-${CRAY_SUNDIALS_VERSION}/lib/${pelevelver}"
+      TPSL_INCFLAGS="-I${CRAY_TPSL_DIR}/${PE_ENV}/sundials-${CRAY_SUNDIALS_VERSION}/include/${pelevelver} \
+      -I${CRAY_TPSL_DIR}/${PE_ENV}/include/${pelevelver}"
+      export CRAY_SUNDIALS_INCLUDE_DIR="${CRAY_TPSL_DIR}/${PE_ENV}/sundials-${CRAY_SUNDIALS_VERSION}/include/${pelevelver}"
+   else
+      TPSL_LDFLAGS="-L${CRAY_TPSL_DIR}/${PE_ENV}/sundials-${CRAY_SUNDIALS_VERSION}/lib/73 \
+      -L${CRAY_TPSL_DIR}/${PE_ENV}/lib/73 ${rpath_prefix}${CRAY_TPSL_DIR}/${PE_ENV}/lib/73 \
+      ${rpath_prefix}${CRAY_TPSL_DIR}/${PE_ENV}/sundials-${CRAY_SUNDIALS_VERSION}/lib/73"
+      TPSL_INCFLAGS="-I${CRAY_TPSL_DIR}/${PE_ENV}/sundials-${CRAY_SUNDIALS_VERSION}/include/73 \
+      -I${CRAY_TPSL_DIR}/${PE_ENV}/include/73"
+      export CRAY_SUNDIALS_INCLUDE_DIR="${CRAY_TPSL_DIR}/${PE_ENV}/sundials-${CRAY_SUNDIALS_VERSION}/include/73"
+   fi
+
+   ###
+   # create the link list
+   ###
+
+   if [ "$tpsl_new_form" == "yes" ] ; then
+
+   LIBTPSL="-lsundials_cvode_${compiler} -lsundials_cvodes_${compiler} \
+   -lsundials_ida_${compiler} -lsundials_idas_${compiler} \
+   -lsundials_kinsol_${compiler} \
+   -lsundials_nvecserial_${compiler} -lsundials_nvecparallel_${compiler} \
+   -lHYPRE_${compiler} -lsuperlu_${compiler} \
+   -lsuperlu_dist_${compiler} \
+   -lcmumps_${compiler} -ldmumps_${compiler} \
+   -lsmumps_${compiler} -lzmumps_${compiler} -lmumps_common_${compiler} \
+   -lpord_${compiler} -lparmetis_${compiler} -lmetis_${compiler} \
+   -lptesmumps_${compiler} -lptscotch_${compiler} \
+   -lptscotcherr_${compiler} -lptscotcherrexit_${compiler} \
+   -lesmumps_${compiler} -lscotch_${compiler} \
+   -lscotcherr_${compiler} -lscotcherrexit_${compiler}"
+
+   elif [ "$tpslver" -ge 1100 ] ; then
+   LIBTPSL="-lsundials_cvode${cpu_suffix} -lsundials_cvodes${cpu_suffix} \
+   -lsundials_ida${cpu_suffix} -lsundials_idas${cpu_suffix} -lsundials_kinsol${cpu_suffix} \
+   -lsundials_nvecserial${cpu_suffix} -lsundials_nvecparallel${cpu_suffix} \
+   -lHYPRE${cpu_suffix} -lsuperlu_4.1${cpu_suffix} -lsuperlu_dist_2.5${cpu_suffix} \
+   -lcmumps${cpu_suffix} -ldmumps${cpu_suffix} \
+   -lsmumps${cpu_suffix} -lzmumps${cpu_suffix} -lmumps_common${cpu_suffix} \
+   -lpord${cpu_suffix} -lparmetis${cpu_suffix} -lmetis${cpu_suffix} \
+   -lptesmumps${cpu_suffix} -lptscotch${cpu_suffix} -lptscotcherr${cpu_suffix} -lptscotcherrexit${cpu_suffix} \
+   -lesmumps${cpu_suffix} -lscotch${cpu_suffix} -lscotcherr${cpu_suffix} -lscotcherrexit${cpu_suffix}"
+
+   else
+   LIBTPSL="-lsundials_cvode${cpu_suffix} -lsundials_cvodes${cpu_suffix} \
+   -lsundials_ida${cpu_suffix} -lsundials_idas${cpu_suffix} -lsundials_kinsol${cpu_suffix} \
+   -lsundials_nvecserial${cpu_suffix} -lsundials_nvecparallel${cpu_suffix} \
+   -lHYPRE${cpu_suffix} -lsuperlu_4.0${cpu_suffix} -lsuperlu_dist_2.3${cpu_suffix} \
+   -lcmumps${cpu_suffix} -ldmumps${cpu_suffix} \
+   -lsmumps${cpu_suffix} -lzmumps${cpu_suffix} -lmumps_common${cpu_suffix} \
+   -lpord${cpu_suffix} -lparmetis${cpu_suffix} -lmetis${cpu_suffix} \
+   -lptesmumps${cpu_suffix} -lptscotch${cpu_suffix} -lptscotcherr${cpu_suffix} -lptscotcherrexit${cpu_suffix} \
+   -lesmumps${cpu_suffix} -lscotch${cpu_suffix} -lscotcherr${cpu_suffix} -lscotcherrexit${cpu_suffix}"
+
+   fi
+
+else
+   LIBTPSL=
+   TPSL_LDFLAGS=
+   TPSL_INCFLAGS=
+fi
+
+####
+# Process petsc
+# Set up the LIBPETSC -l libs. It's different for complex versus real.
+# Version 3.0.0 and beyond have quadcore libs and define PETSC_VERSION/PETSC_COMPLEX_VERSION
+
+if [ ${PETSC_POST_LINK_OPTS:+1} ] || [ ${CRAY_PETSC_DIR:+1} ] ; then
+
+## We need to account for the change to CRAY_* env var naming.
+
+   if [ ${PETSC_POST_LINK_OPTS:+1} ] ; then
+        if [ ${PETSC_VERSION:+1} ] ; then
+           unset PETSC_INCLUDE_OPTS PETSC_POST_LINK_OPTS
+           petsc_type="real"
+           petsc_full_version="${PETSC_VERSION}"
+        elif [ ${PETSC_COMPLEX_VERSION:+1} ] ; then
+           unset PETSC_INCLUDE_OPTS PETSC_POST_LINK_OPTS
+           petsc_type="complex"
+           petsc_full_version="${PETSC_COMPLEX_VERSION}"
+        fi
+   elif [ ${CRAY_PETSC_VERSION:+1} ] ; then
+           petsc_type="real"
+           petsc_full_version="${CRAY_PETSC_VERSION}"
+   elif [ ${CRAY_PETSC_COMPLEX_VERSION:+1} ] ; then
+           petsc_type="complex"
+           petsc_full_version="${CRAY_PETSC_COMPLEX_VERSION}"
+   fi
+
+   if [ "$petsc_new_form" == "yes" ] ; then
+        petsc_full_path="${CRAY_PETSC_DIR}/CRAY/${petsc_gen_compiler_ver}/${PETSC_CRAY_CPU_TARGET}"
+        PETSC_LDFLAGS="-L${petsc_full_path}/lib"
+        PETSC_INCFLAGS="-I${petsc_full_path}/include"
+        PETSC_RPATHFLAGS="$rpath_prefix${petsc_full_path}/lib"
+        petsc_fmodules_dir="${petsc_full_path}/include"
+   elif [ "$petscver" -ge 3105 ] ; then
+     if [ ${PETSC_X86_64:+1} ] ; then
+        petsc_full_path="$PETSC_X86_64/${petsc_type}/CRAY"
+     else
+        petsc_full_path="/opt/petsc/${petsc_full_version}/${petsc_type}/CRAY"
+     fi
+      if [ ${pelevelver} -le 72 ] ; then
+        PETSC_LDFLAGS="-L${petsc_full_path}/lib/72 $rpath_prefix${petsc_full_path}/lib/72"
+        PETSC_INCFLAGS="-I${petsc_full_path}/include/72"
+        petsc_fmodules_dir="${petsc_full_path}/include/72"
+      elif [ -d ${petsc_full_path}/lib/${pelevelver} ] ; then
+        PETSC_LDFLAGS="-L${petsc_full_path}/lib/${pelevelver} $rpath_prefix${petsc_full_path}/lib/${pelevelver}"
+        PETSC_INCFLAGS="-I${petsc_full_path}/include/${pelevelver}"
+        petsc_fmodules_dir="${petsc_full_path}/include/${pelevelver}"
+      else
+        PETSC_LDFLAGS="-L${petsc_full_path}/lib/73 $rpath_prefix${petsc_full_path}/lib/73"
+        PETSC_INCFLAGS="-I${petsc_full_path}/include/73"
+        petsc_fmodules_dir="${petsc_full_path}/include/73"
+      fi
+   else
+      petsc_full_path="/opt/petsc/${petsc_full_version}/${petsc_type}/CRAY/linux"
+      PETSC_LDFLAGS="-L${petsc_full_path}/lib $rpath_prefix${petsc_full_path}/lib"
+      PETSC_INCFLAGS="-I${petsc_full_path}/include"
+      petsc_fmodules_dir="${petsc_full_path}/include"
+   ##
+   # Don't use the tpsl libs even if they are loaded. Use the petsc-supplied ones for pre 3.1.05 petsc.
+      LIBTPSL=
+      TPSL_LDFLAGS=
+      TPSL_INCFLAGS=
+   fi
+
+  ###
+  # figure out link list
+  ###
+
+   if [ "$petsc_new_form" == "yes" ] ; then
+           LIBPETSC="-lcraypetsc_cray_${petsc_type}"
+   elif [ "$petscver" -ge 3105 ] ; then
+           LIBPETSC="-lcraypetsc${cpu_suffix}"
+   elif  [ "$petsc_type" == "real" ] ; then
+           LIBPETSC="-lcraypetsc${cpu_suffix} -lHYPRE${cpu_suffix} -lsuperlu_${superluver}${cpu_suffix} \
+           -lsuperlu_dist_2.3${cpu_suffix} -lcmumps${cpu_suffix} -ldmumps${cpu_suffix} -lsmumps${cpu_suffix} \
+           -lzmumps${cpu_suffix} -lmumps_common${cpu_suffix} -lpord${cpu_suffix} -lparmetis${cpu_suffix} -lmetis${cpu_suffix}"
+   elif [ "$petsc_type" == "complex" ] ; then
+           LIBPETSC="-lcraypetsc${cpu_suffix} -lsuperlu_dist_2.3${cpu_suffix} -lsuperlu_${superluver}${cpu_suffix} \
+           -lcmumps${cpu_suffix} -ldmumps${cpu_suffix} -lsmumps${cpu_suffix} -lzmumps${cpu_suffix} \
+           -lmumps_common${cpu_suffix} -lpord${cpu_suffix} -lparmetis${cpu_suffix} -lmetis${cpu_suffix}"
+   fi
+
+else
+   LIBPETSC=
+   PETSC_LDFLAGS=
+   PETSC_INCFLAGS=
+fi
+
+####
+# Process netcdf libraries
+# -lnetcdf must precede -lhdf5
+
+if [ ${NETCDF_POST_LINK_OPTS:+1} ] || [ ${CRAY_NETCDF_DIR:+1} ] ; then
+
+###Look for gen compiler
+
+   if [ ${CRAY_NETCDF:+1} ] ; then
+      netcdf_gen_compiler_ver=${CRAY_NETCDF}
+   else
+      netcdf_gen_compiler_ver=73
+   fi
+
+   parallel=
+
+#return the basename dir from NETCDF_DIR
+#We set NETCDF_DIR in the netcdf module and don't change its value.
+#   if [ ${NETCDF_DIR:+1} ] ; then
+#      CRAY_NETCDF_DIR=${NETCDF_DIR%/*}
+#   fi
+
+   is_it_parallel=`echo $CRAY_NETCDF_DIR | grep -c "parallel"`
+
+   if [ ${NETCDF_VERSION:+1} ] ; then
+        CRAY_NETCDF_VERSION=$NETCDF_VERSION
+   fi
+   if [ ${NETCDF_PARALLEL_VERSION:+1} ] ; then
+        CRAY_NETCDF_PARALLEL_VERSION=$NETCDF_PARALLEL_VERSION
+   fi
+
+   if [ ${CRAY_NETCDF_PARALLEL_VERSION:+1} ] ; then
+        parallel="-hdf5parallel"
+        new_parallel="_parallel"
+        netcdfuver=`echo "$CRAY_NETCDF_PARALLEL_VERSION" | cut -d. -f1`
+   elif [ "$is_it_parallel" == "1" ] ; then
+        parallel="-hdf5parallel"
+        new_parallel="_parallel"
+        netcdfuver=`echo "$CRAY_NETCDF_VERSION" | cut -d. -f1`
+   else
+        netcdfuver=`echo "$CRAY_NETCDF_VERSION" | cut -d. -f1`
+   fi
+
+   if [ "${CRAY_REAL64}" == "yes" ] ; then
+       real64_dir_suffix="-real64"
+       real64_lib_suffix="_real64"
+   fi
+
+   ###
+   # See if we are using new dso formatting
+   ###
+
+   if [ -d ${CRAY_NETCDF_DIR}/cray ] ; then
+         
+     netcdf_full_path="${CRAY_NETCDF_DIR}/cray${real64_dir_suffix}"
+     NETCDF_LDFLAGS="-L$netcdf_full_path/$netcdf_gen_compiler_ver/lib"
+     NETCDF_RPATHFLAGS="${rpath_prefix}$netcdf_full_path/$netcdf_gen_compiler_ver/lib"
+     NETCDF_INCFLAGS="-I$netcdf_full_path/$netcdf_gen_compiler_ver/include"
+     if [ "$XTPE_LINK_TYPE" == "static" ] ; then
+#6/8/12-corrected path (documented rt#138013)
+       #LIBNETCDF="-lnetcdff_cray${new_parallel}${real64_lib_suffix} -lnetcdf_cray${new_parallel}${real64_lib_suffix}"
+       LIBNETCDF="-lnetcdff_cray${real64_lib_suffix}${new_parallel} -lnetcdf_cray${real64_lib_suffix}${new_parallel}"
+     else
+       #LIBNETCDF="-lnetcdff_cray${new_parallel}${real64_lib_suffix} -lnetcdf_cray${new_parallel}${real64_lib_suffix}"
+       LIBNETCDF="-lnetcdff_cray${real64_lib_suffix}${new_parallel} -lnetcdf_cray${real64_lib_suffix}${new_parallel}"
+     fi
+     netcdf_fmodules_dir="$netcdf_full_path/$netcdf_gen_compiler_ver/include"
+   else
+     unset NETCDF_POST_LINK_OPTS NETCDF_INCLUDE_OPTS
+     netcdf_full_path="${CRAY_NETCDF_DIR}/netcdf${parallel}-cce${real64_dir_suffix}"
+     NETCDF_LDFLAGS="-L$netcdf_full_path/lib ${rpath_prefix}$netcdf_full_path/lib"
+     NETCDF_INCFLAGS="-I$netcdf_full_path/include"
+     netcdf_fmodules_dir="$netcdf_full_path/include"
+
+     if [ -f $netcdf_full_path/lib/libnetcdff.a ] ; then
+        LIBNETCDF="-lnetcdff -lnetcdf"
+     else
+        LIBNETCDF="-lnetcdf"
+     fi
+   fi
+
+else
+     LIBNETCDF=
+     NETCDF_LDFLAGS=
+     NETCDF_INCFLAGS=
+fi
+
+####
+# Process HDF5 libraries
+
+if [ ${HDF5_POST_LINK_OPTS:+1} ] || [ ${CRAY_HDF5_DIR:+1} ] ; then
+
+###Look for gen compiler
+
+   if [ ${CRAY_HDF5:+1} ] ; then
+      hdf5_gen_compiler_ver=${CRAY_HDF5}
+   else
+      hdf5_gen_compiler_ver=73
+   fi
+
+   parallel=
+
+#return the basename dir from HDF5_DIR, CRAY_HDF5_DIR is basename already
+#We set HDF5_DIR in the module, but don't change it's value.
+#   if [ ${HDF5_DIR:+1} ] ; then
+#      CRAY_HDF5_DIR=${HDF5_DIR%/*}
+#   fi
+
+   is_it_parallel=`echo $CRAY_HDF5_DIR | grep -c "parallel"`
+
+   if [ ${HDF5_VERSION:+1} ] ; then
+        CRAY_HDF5_VERSION=$HDF5_VERSION
+   fi
+   if [ ${HDF5_PARALLEL_VERSION:+1} ] ; then
+        CRAY_HDF5_PARALLEL_VERSION=$HDF5_PARALLEL_VERSION
+   fi
+
+   if [ ${HDF5_PARALLEL_VERSION:+1} ] || [ "$is_it_parallel" == "1" ] ; then
+        parallel="-parallel"
+        new_parallel="_parallel"
+   fi
+
+   unset HDF5_POST_LINK_OPTS HDF5_INCLUDE_OPTS
+
+  if [ -d $CRAY_HDF5_DIR/cray ] ; then
+     hdf5_full_path="${CRAY_HDF5_DIR}/cray"
+     HDF5_LDFLAGS="-L$hdf5_full_path/${hdf5_gen_compiler_ver}/lib"
+     HDF5_RPATHFLAGS="${rpath_prefix}$hdf5_full_path/${hdf5_gen_compiler_ver}lib"
+     HDF5_INCFLAGS="-I$hdf5_full_path/${hdf5_gen_compiler_ver}/include"
+     hdf5_fmodules_dir="$hdf5_full_path/${hdf5_gen_compiler_ver}/include"
+     LIBHDF5="-lhdf5hl_fortran_cray${new_parallel} -lhdf5_hl_cray${new_parallel} -lhdf5_fortran_cray${new_parallel} -lhdf5_cray${new_parallel} -lz"
+
+  else
+     hdf5_full_path="${CRAY_HDF5_DIR}/hdf5${parallel}-cce"
+     HDF5_LDFLAGS="-L$hdf5_full_path/lib ${rpath_prefix}$hdf5_full_path/lib"
+     HDF5_INCFLAGS="-I$hdf5_full_path/include"
+     hdf5_fmodules_dir="$hdf5_full_path/include"
+     LIBHDF5="-lhdf5hl_fortran -lhdf5_hl -lhdf5_fortran -lhdf5 -lz"
+  fi
+
+else
+     LIBHDF5=
+     HDF5_LDFLAGS=
+     HDF5_INCFLAGS=
+     HDF5_RPATHFLAGS=
+fi
+
+####
+# Process CRAY_PARALLEL_NETCDF
+
+
+if [ ${CRAY_PARALLEL_NETCDF_VERSION:+1} ] ; then
+
+     if [ "$XTPE_NETWORK_TARGET" == "seastar" ] ; then
+        if [ ${XTPE_INFO_MESSAGE_ON:+1} ] ; then
+                info WARNING: "parallel-netcdf does not support seastar."
+        fi
+
+        PNETCDF_LDFLAGS=
+        PNETCDF_RPATHFLAGS=
+        PNETCDF_INCFLAGS=
+        LIBPNETCDF=
+
+     else
+###
+#  Try to establish pnetcef_gen_compiler_ver
+
+     pnetver=`echo $CRAY_PARALLEL_NETCDF_VERSION | cut -d. -f1-3 | sed -e "s/\.//g"`
+
+        if [ "$pnetver" -ge 120 ] ; then
+             pnetcdf_gen_compiler_ver=73
+        fi
+
+        PNETCDF_LDFLAGS="-L$CRAY_PARALLEL_NETCDF_DIR/$compiler/${pnetcdf_gen_compiler_ver}/lib"
+        PNETCDF_INCFLAGS="-I$CRAY_PARALLEL_NETCDF_DIR/$compiler/${pnetcdf_gen_compiler_ver}/include"
+        PNETCDF_RPATHFLAGS="${rpath_prefix}$CRAY_PARALLEL_NETCDF_DIR/$compiler/${pnetcdf_gen_compiler_ver}/lib"
+        LIBPNETCDF="-lpnetcdf"
+        pnetcdf_fmodules_dir="$CRAY_PARALLEL_NETCDF_DIR/$compiler/${pnetcdf_gen_compiler_ver}/include"
+
+     fi
+
+else
+     PNETCDF_LDFLAGS=
+     PNETCDF_RPATHFLAGS=
+     PNETCDF_INCFLAGS=
+     LIBPNETCDF=
+     pnetcdf_fmodules_dir=
+fi
+
+##
+# PMI
+##
+if [ ${CRAY_PMI_POST_LINK_OPTS:+1} ] || [ ${PMI_POST_LINK_OPTS:+1} ] ; then
+        LIBPMI="-lpmi"
+        PMI_LDFLAGS=
+        PMI_INCFLAGS=
+elif [ ${MPT_VERSION:+1} ] && [ "$XTPE_NETWORK_TARGET" == "seastar" ] ; then
+     :
+else
+        LIBPMI=
+fi
+
+##
+# UGNI
+##
+if [ ${CRAY_UGNI_POST_LINK_OPTS:+1} ] && [ "$XTPE_LINK_TYPE" == "static" ] ; then
+        LIBUGNI="-lugni"
+else
+        LIBUGNI=
+fi
+
+##
+# UDREG
+##
+if [ ${CRAY_UDREG_POST_LINK_OPTS:+1} ] && [ "$XTPE_LINK_TYPE" == "static" ] ; then
+        LIBUDREG="-ludreg"
+else
+        LIBUDREG=
+fi
+
+##
+# DMAPP
+##
+if [ ${CRAY_DMAPP_POST_LINK_OPTS:+1} ] && [ "$XTPE_LINK_TYPE" == "static" ] ; then
+        LIBDMAPP="-ldmapp"
+else
+        LIBDMAPP=
+fi
+##
+# XPMEM
+##
+if [ ${CRAY_XPMEM_POST_LINK_OPTS:+1} ] && [ "$XTPE_LINK_TYPE" == "static" ] ; then
+        LIBXPMEM="-lxpmem"
+else
+        LIBXPMEM=
+fi
+
+##
+# GA
+# The order should be  libga, libonesided, libntk
+# so set the load list in CNL_LIBS_LIST
+##
+if [ ${CRAY_GA_DIR:+1} ] ; then
+   if [ "$XTPE_NETWORK_TARGET" == "gemini" ] ; then
+       GA_LDFLAGS="-L$CRAY_GA_DIR/gem/lib"
+       GA_INCFLAGS="-I$CRAY_GA_DIR/gem/include"
+       GA_RPATHFLAGS="${rpath_prefix}$CRAY_GA_DIR/gem/lib"
+       if [ -f ${CRAY_GA_DIR}/gem/lib/libglobal.so ] ; then
+          LIBGA="-lglobal -lma -llinalg -larmci -ltcgmsg-mpi"
+       else
+          LIBGA="-lga -larmci"
+       fi
+   elif [ "$XTPE_LINK_TYPE" == "static" ] ; then
+       GA_LDFLAGS="-L$CRAY_GA_DIR/ss/lib"
+       GA_INCFLAGS="-I$CRAY_GA_DIR/ss/include"
+       LIBGA="-lglobal -lma -llinalg -larmci -ltcgmsg-mpi"
+   else
+       GA_LDFLAGS=
+       GA_RPATHFLAGS=
+       LIBGA=
+   fi
+else
+       GA_LDFLAGS=
+       GA_RPATHFLAGS=
+       LIBGA=
+fi
+
+## 
+# ONESIDED
+# supports gemini only
+# The order should be  libga, libonesided, libntk
+## 
+if [ ${CRAY_ONESIDED_DIR:+1} ] ; then
+   if [ "$XTPE_NETWORK_TARGET" == "gemini" ] ; then
+       ONESIDED_RPATHFLAGS="${rpath_prefix}$CRAY_ONESIDED_DIR/gem/lib"
+       LIBONESIDED="-lonesided -lm"
+   else
+       ONESIDED_RPATHFLAGS=
+       LIBONESIDED=
+   fi
+else
+       ONESIDED_RPATHFLAGS=
+       LIBONESIDED=
+fi
+
+## 
+# NTK
+# The order should be  libga, libonesided, libntk
+##
+if [ ${CRAY_NTK_DIR:+1} ] ; then
+    if [ "$XTPE_NETWORK_TARGET" == "gemini" ] ; then
+    NTK_RPATHFLAGS="${rpath_prefix}$CRAY_NTK_DIR/gem/lib"
+       if [ "$XTPE_LINK_TYPE" == "dynamic" ] ; then
+          LIBNTK="-lnuma -lnumatoolkit -lm"
+       else
+          LIBNTK="-lnumatoolkit -lm"
+       fi
+    else
+       NTK_RPATHFLAGS=
+       LIBNTK=
+    fi
+else
+       NTK_RPATHFLAGS=
+       LIBNTK=
+fi
+
+###
+# rpath backup and runtime for libsci and others
+###
+
+if [ "${CRAY_MPICH2_DIR}" == "" ] && [ "${MPT_DIR}" == "" ] && [ "${CPE_MPICH2_VERSION}" == "" ] ; then
+      if [ "$XTPE_LINK_TYPE" == "dynamic" ] && [ ${LIBSCI_BASE_DIR:+1} ] ; then
+           if [ -d /opt/cray/mpt/default/xt/${network}/mpich2-cray/lib ] ; then
+                 MPT_LDFLAGS="-L/opt/cray/mpt/default/xt/${network}/mpich2-cray/lib\
+                 ${rpath_prefix}/opt/cray/mpt/default/xt/${network}/mpich2-cray/lib"
+                   LIBSCI="$LIBSCI -lmpichf90 -lmpich -lmpl"
+           elif [ -d /opt/cray/mpt/default/xt/${network}/mpich2-cray/${gen_compiler_version}/lib ] ; then
+              MPT_LDFLAGS="-L/opt/cray/mpt/default/xt/${network}/mpich2-cray/${gen_compiler_version}/lib"
+                LIBSCI="$LIBSCI -lmpichf90_cray${is_default64} -lmpich_cray${is_default64} -lmpl"
+           fi
+      fi
+fi
+
+###
+# Special casing to deal with blcr library and pmi order. It must be -lpmi -lcr when BLCR
+# is loaded and either xt-mpt/xt-mpich2 or pmi is loaded.
+
+if [ ${BLCR_POST_LINK_OPTS:+1} ]  ; then
+    if [ ${CRAY_PMI_INCLUDE_OPTS:+1} ] || [ ${CRAY_MPICH2_VERSION:+1} ] || [ ${MPT_VERSION:+1} ] ; then
+        export BLCR_POST_LINK_OPTS="-lpmi $BLCR_POST_LINK_OPTS"
+    fi
+fi
+
+
+PRODUCT_CFLAGS="$GA_INCFLAGS $MPT_INCFLAGS $MPICH2_INCFLAGS $SMA_INCFLAGS $SHMEM_INCFLAGS $PMI_INCFLAGS $ACML_INCFLAGS $LIBSCI_ACC_INCFLAGS $SCI_INCFLAGS $FFTW_INCFLAGS $SMA_INCFLAGS $PETSC_INCFLAGS $HDF5_INCFLAGS $PNETCDF_INCFLAGS $NETCDF_INCFLAGS $TPSL_INCFLAGS"
+PRODUCT_LDFLAGS="$GA_LDFLAGS $MPT_LDFLAGS $MPICH2_LDFLAGS $SMA_LDFLAGS $SHMEM_LDFLAGS $PMI_LDFLAGS $ACML_LDFLAGS $LIBSCI_ACC_LDFLAGS $SCI_LDFLAGS $FFTW_LDFLAGS $SMA_LDFLAGS $PMI_LDFLAGS $PETSC_LDFLAGS $HDF5_LDFLAGS $PNETCDF_LDFLAGS $NETCDF_LDFLAGS $TPSL_LDFLAGS $PORTALS_LDFLAGS"
+
+if [ "$CRAY_ADD_RPATH" == "yes" ] ; then
+   PRODUCT_RPATHFLAGS="$GA_RPATHFLAGS $ONESIDED_RPATHFLAGS $NTK_RPATHFLAGS $MPT_RPATHFLAGS $MPICH2_RPATHFLAGS $SMA_RPATHFLAGS $SHMEM_RPATHFLAGS $PMI_RPATHFLAGS $ACML_RPATHFLAGS $LIBSCI_ACC_RPATHFLAGS $SCI_RPATHFLAGS $FFTW_RPATHFLAGS $SMA_RPATHFLAGS $PMI_RPATHFLAGS $PETSC_RPATHFLAGS $HDF5_RPATHFLAGS $PNETCDF_RPATHFLAGS $NETCDF_RPATHFLAGS $TPSL_RPATHFLAGS $PORTALS_RPATHFLAGS"
+else
+   PRODUCT_RPATHFLAGS=
+fi
+
+# Aug 14 '07 change order again because acml becomes optional.
+# 2009 netcdf before hdf5
+# -lsci -lsma -lmpich -lpmi
+# Let's try adding a big "as-needed"
+
+#if [ "${XTPE_LINK_TYPE}" == "dynamic" ] && [ "$osver" -gt 30 ] && [ ${CRAYPE_AS_NEEDED:+1} ] ; then
+if [ "$osver" -gt 30 ] && [ ${CRAYPE_AS_NEEDED:+1} ] ; then
+    as_needed_on="-Wl,--as-needed"
+    as_needed_off="-Wl,--no-as-needed"
+else
+    as_needed_on=
+    as_needed_off=
+fi
+
+CNL_LIBS_LIST="$CNL_LIBS_LIST ${as_needed_on} $LIBGA $LIBONESIDED $LIBNTK $LIBTRILINOS \
+    $LIBPETSC ${as_needed_off} $LIBTPSL ${as_needed_on} $LIBPNETCDF $LIBNETCDF $LIBHDF5 $LIBSCI_ACC $LIBSCI $LIBFFTW \
+    $LIBSHMEM $LIBSMA $LIBMPT $LIBMPICH2 $LIBXPMEM $LIBDMAPP $LIBPMI $LIBUGNI \
+    ${as_needed_off} $LIBALPS $LIBPORTALS ${as_needed_on} $LIBUDREG ${as_needed_off}"
+
+LIBSPATH="$PRODUCT_LDFLAGS $APP_LIBS_DIR $CNL_LIBS_DIR $SE_LIBS_DIR"
+
+if [ "$CRAYPE_COMPILE_TARGET" == "native" ] || [ "$CRAY_SHARED" == "yes" ] ; then
+   CNL_LIBS_LIST=
+   MPT_INCFLAGS=
+   MPT_LDFLAGS=
+   CFLAGS=
+   SYSROOT_LIBS_PATH=
+elif [ "${network}" == "gemini" ] ; then
+   if [ "$XTPE_LINK_TYPE" == "dynamic" ] ; then
+      CNL_LIBS_LIST="$CNL_LIBS_LIST -lpthread $LIBM"
+      CFLAGS="$CFLAGS -D__CRAYXE -D__CRAYXT_COMPUTE_LINUX_TARGET -D__TARGET_LINUX__ $PRODUCT_CFLAGS $APP_INCS_DIR"
+   else
+      CNL_LIBS_LIST="$CNL_LIBS_LIST $LIBM"
+      CFLAGS="$CFLAGS -D__CRAYXE -D__CRAYXT_COMPUTE_LINUX_TARGET -D__TARGET_LINUX__ $PRODUCT_CFLAGS $APP_INCS_DIR"
+   fi
+elif [ "$XTPE_LINK_TYPE" == "dynamic" ] ; then
+      CNL_LIBS_LIST="$CNL_LIBS_LIST -lpthread $LIBM"
+      CFLAGS="$CFLAGS -D__CRAYXT -D__CRAYXT_COMPUTE_LINUX_TARGET -D__TARGET_LINUX__ $PRODUCT_CFLAGS $APP_INCS_DIR"
+else
+      CNL_LIBS_LIST="$CNL_LIBS_LIST $LIBM"
+      CFLAGS="$CFLAGS -D__CRAYXT -D__CRAYXT_COMPUTE_LINUX_TARGET -D__TARGET_LINUX__ $PRODUCT_CFLAGS $APP_INCS_DIR"
+fi
+
+if [ ${CRAY_ACCEL_TARGET:+1} ] ; then
+   CNL_LIBS_LIST="$CNL_LIBS_LIST -lstdc++"
+fi
+
+export FORTRAN_SYSTEM_MODULES=${FORTRAN_SYSTEM_MODULES}:${CRAYLIBS:+${CRAYLIBS}/libmodules.a:${CRAYLIBS}/omp_lib.a}:${MPT_DIR:+${mpt_fmodules_dir}}:${CRAY_MPICH2_BASEDIR:+${mpich2_fmodules_dir}}:${PAT_X86_64:+${PAT_X86_64}/lib/lib_pat_apif.a}:${petsc_fmodules_dir:+${petsc_fmodules_dir}}:${pnetcdf_fmodules_dir}:${netcdf_fmodules_dir}:${hdf5_fmodules_dir}:${cpe_fmodules_dir}:${LIBSCI_BASE_DIR:+${LIBSCI_BASE_DIR}/cray/include:${libsci_fmodules_dir}}
+
+export LISTER=${LISTER:-$FTN_X86_64/lib/ftnlx}
+export FORTRAN_SYSTEM_MODULE_NAMES=ftn_lib_definitions
+
+####
+# Check for PE_LEVEL
+#  -ulast_user_arg must be first argument after user
+#   command line entries. Appears in 5.0 cftn.
+#   Linux doesn't like the "-ge" usage, so we're avoiding it.
+#   Since no one is running a pre-5.0 compiler, we'll just set
+#   END_USER_ARG
+####
+END_USER_ARG="-ulast_user_arg"
+
+###
+#PE products use BUILD_OPTS_ARGS to dynamically set proper options.
+###
+
+export BUILD_OPTS_ARGS="$PE_ENV ${FTN_DRIVER} ${_FTN_OPTS} "$@" $END_USER_ARG \
+           ${INC_PATH}} ${INCDIRS} -L${CRAYLIBS} ${LIB_PATH} ${CMDOPTS} \
+           ${GCC_BASE} ${SYSROOT} $LIBSPATH $CNL_LIBS_LIST $SYSROOT_LIBS_PATH $ALPS_LDFLAGS"
+
+export BUILD_OPTS=${BUILD_OPTS:-/opt/cray/xt-asyncpe/default/bin/build-opts}
+
+if [ -f ${BUILD_OPTS} ] ; then
+      	eval $($BUILD_OPTS)
+fi
+
+_RUN_OPTIONS="${_FTN_OPTS} $compile_opts $PRE_COMPILE_OPTS $PRE_LINK_OPTS "$@" $END_USER_ARG \
+           $INCLUDE_OPTS ${INC_PATH} $SYSROOT_INC_PATH ${INCDIRS} \
+	   $POST_COMPILE_OPTS $POST_LINK_OPTS -L${CRAYLIBS} ${rpath_prefix}${CRAYLIBS} ${LIB_PATH} \
+           ${CMDOPTS} ${GCC_BASE} ${SYSROOT} $CFLAGS $LIBSPATH $CNL_LIBS_LIST $SYSROOT_LIBS_PATH $ALPS_LDFLAGS $PRODUCT_RPATHFLAGS"
+
+if [ ! ${__CRAY_DEBUG_DRIVER:+1} ] ; then
+        exec "${FTN_DRIVER}" ${_FTN_OPTS} $compile_opts $PRE_COMPILE_OPTS $PRE_LINK_OPTS "$@" $END_USER_ARG \
+           $INCLUDE_OPTS ${INC_PATH} $SYSROOT_INC_PATH ${INCDIRS} \
+           $POST_COMPILE_OPTS $POST_LINK_OPTS -L${CRAYLIBS} ${rpath_prefix}${CRAYLIBS} ${LIB_PATH} \
+           ${CMDOPTS} ${GCC_BASE} ${SYSROOT} $CFLAGS $LIBSPATH $CNL_LIBS_LIST $SYSROOT_LIBS_PATH $ALPS_LDFLAGS $PRODUCT_RPATHFLAGS
+else
+  rm -r -f .dbg.driver.cmd
+  echo "break main" > .dbg.driver.cmd
+  echo "run ${_RUN_OPTIONS}" >> .dbg.driver.cmd
+  ${__CRAY_DEBUG_DRIVER} "${FTN_DRIVER}"  -x .dbg.driver.cmd
+  rm -r -f .dbg.driver.cmd
+fi
