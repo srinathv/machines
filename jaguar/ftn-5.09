@@ -1,0 +1,593 @@
+#!/bin/bash
+# SVNID @(#)$Id: ftn 1615 2012-04-13 15:17:16Z bam $
+#
+# (c) Cray Inc.  All Rights Reserved.  Unpublished Proprietary
+# Information.  This unpublished work is protected to trade secret,
+# copyright and other laws.  Except as permitted by contract or
+# express written permission of Cray Inc., no part of this work or
+# its content may be used, reproduced or disclosed in any form.
+#
+#----------------------------------------------------------------------
+# This script is a driver for the generic ftn compiler.  The purpose of
+# this is to set up programming environment paths and env vars.
+#----------------------------------------------------------------------
+
+###
+# CRAYPE_COMPILE_TARGET:   compute_node, local_host, native, petest (in-house only)
+# XTPE_COMPILE_TARGET:  linux, native, petest ---DEPRICATED
+# XTPE_OS_TARGET:       snos  (compute node)
+# XTPE_COMPILER:   pgi gnu pathscale cray intel  (lower case)
+# XTOS_VERSION:  Set by modulefile Base-opts as @VERSION@
+# XTPE_NETWORK_TARGET: gemini, seastar
+###
+
+if [ $# -eq 0 ] ; then
+cat << EOF
+# Special Targeting Options
+#
+# -target=compute_node  Generate code executable on Cray hardware. This is the default.
+# -target=local_host    Generate code executable on esLogin node or cross compile machine. The 
+#         resulting code will not link in network (portals, uGNI, etc.), communication (mpich, shmem, etc.),
+#         or ALPS libraries that are needed to execute on Cray compute nodes.
+# -target=native        Generate code directly from the chosen compiler without adding any module-generated information.
+#
+EOF
+exit
+fi
+
+errorexit() {
+    echo "${PROG}: ERROR: $*" >&2
+    exit 1
+}
+
+info() {
+    echo "${PROG}: INFO: $*" >&2
+}
+
+Usage() {
+echo "$0 
+# Special Targeting Options
+#
+# -target=compute_node  Generate code executable on Cray hardware. This is the default.
+# -target=local_host    Generate code executable on esLogin node or cross compile machine. The 
+#         resulting code will not link in network (portals, uGNI, etc.), communication (mpich, shmem, etc.),
+#         or ALPS libraries that are needed to execute on Cray compute nodes.
+# -target=native        Generate code directly from the chosen compiler without adding any module-generated information.
+#
+"
+exit 0
+}
+
+PROG=$0		# name of program
+target=0	# a zero value says -target is not on option to the command
+found=0
+
+calling_name=`basename $0`
+
+if [ "$calling_name" == "f77" ] && [ "$PE_ENV" == "PGI" ] ; then
+       echo "INFO: f77 is deprecated and aliased to ftn. Please use ftn."
+       echo "      The f77 link will not appear in future releases."
+elif [ "$calling_name" == "f77" ] ; then
+       errorexit "The $PE_ENV compiler does not support f77.  Please use ftn."
+fi
+
+if [ ! ${XTOS_VERSION:+1} ] ; then
+        export XTOS_VERSION="2.3"
+        osver=`echo ${XTOS_VERSION}|sed -e "s/\.//g"| cut -c1-2`
+fi
+
+export XTPE_OS_TARGET=snos
+
+##
+# nvidia compiler does not support fortran
+##
+if [ "${PE_ENV}" == "NVIDIA" ] ; then
+	errorexit "The nvidia PE does not support fortran."
+fi
+
+##
+# Establish a default target if one isn't set.
+##
+if [ ${XTPE_NETWORK_TARGET:+1} ] ; then
+        network=${XTPE_NETWORK_TARGET}
+else
+        network="seastar"
+        export XTPE_NETWORK_TARGET=$network
+fi
+
+##
+# See if CRAYPE_COMPILE_TARGET is set and set "target" appropriately.
+# Later, override this value if -target is set on commandline.
+# We're changing the -target name from linux to compute_node.
+##
+
+if [ ${CRAYPE_COMPILE_TARGET:+1} ] ; then
+     target=${CRAYPE_COMPILE_TARGET}
+elif [ ${XTPE_COMPILE_TARGET:+1} ] ; then
+     target=${XTPE_COMPILE_TARGET}
+else
+     target="compute_node"
+     export XTPE_COMPILE_TARGET=linux
+fi
+
+if [ "$target" == "linux" ] || [ "$target" == "compute_node" ] ; then
+     target="compute_node"
+     export CRAYPE_COMPILE_TARGET=$target
+elif  [ "$target" == "local_host" ] ; then
+     export CRAYPE_AS_NEEDED=yes
+     export CRAYPE_COMPILE_TARGET=$target
+else
+     export CRAYPE_COMPILE_TARGET=$target
+fi
+
+link_opts=
+
+# Parse the command line options searching for options 
+#
+arglist=("$@")
+argno=0
+noarg_version=0
+seen_hugetlbfs=no
+hugetlbfs=no
+libsci_suffix=
+compile_opts=
+for cmd_option; do
+    # Save the second part of an command-line option
+    #
+    cmd_optarg=`expr "x$cmd_option" : 'x[^=]*=\(.*\)'`
+
+    # Search for options that the driver understands versus the generic
+    # compiler options
+    #
+    case $cmd_option in
+    -V)
+	noarg_version=1
+        export XTPE_INFO_MESSAGE_ON=yes
+	;;
+    -v | --version)
+        noarg_version=1
+        export XTPE_INFO_MESSAGE_ON=yes
+        ;;
+    -target=* | --target=* )
+        target=$cmd_optarg
+        unset arglist[$argno]
+        if [ "$target" == "linux" ] || [ "$target" == "compute_node" ] ; then
+           export CRAYPE_COMPILE_TARGET=compute_node
+           target="compute_node"
+        elif  [ "$target" == "local_host" ] ; then
+           export CRAYPE_AS_NEEDED=yes
+           export CRAYPE_COMPILE_TARGET=$target
+        else
+           export CRAYPE_COMPILE_TARGET=$target
+        fi
+        found=1
+        ;;
+    -add_rpath)
+        export CRAY_ADD_RPATH=yes
+        unset arglist[$argno]
+        ;;
+    -help | --help )
+        target=native
+        help=yes
+        if [ "$PE_ENV" == "CRAY" ] ; then
+           Usage
+        fi
+        ;;
+    -driverpath=* | --driverpath=* )
+	driverpath=$cmd_optarg
+	unset arglist[$argno]
+        ;;
+    -hstatic )
+        static=yes
+	;;
+    -hdynamic )
+        dynamic=yes
+	;;
+    -shared )
+        if [ "${PE_ENV}" = "CRAY" ] ; then
+            arglist[$argno]="-hshared"
+	    export CRAY_SHARED=yes
+            target=native
+        fi
+        dynamic=yes
+        ;;
+    -Bdynamic | -dynamic )
+        dynamic=yes
+        unset arglist[$argno]
+        ;;
+    -Bstatic | -static )
+        static=yes
+        unset arglist[$argno]
+        ;;
+    -tp | -tp=istanbul-64 | -tp=shanghai-64 | -tp=barcelona-64 )
+	if [ "${PE_ENV}" = "PGI" ] ; then
+            export PGI_USER_TP_OPT=yes
+        fi
+        ;;
+    -ta*)
+        if [ "${PE_ENV}" = "PGI" ] ; then
+            export PGI_USER_TA_OPT=yes
+        fi
+        ;;
+    -default64 | --default64 )
+	if [ "${PE_ENV}" == "PGI" ] || [ "${PE_ENV}" == "CRAY" ] ; then
+	        export FTN_DEFAULT64=yes
+                if [ "${PE_ENV}" == "CRAY" ] ; then
+                   compile_opts="$compile_opts -sdefault64"
+                fi
+        else
+		errorexit "-default64 is not supported with this compiler."
+	fi
+        unset arglist[$argno]
+        ;;
+    -sdefault64 )
+        if [ "${PE_ENV}" != "CRAY" ]
+        then
+                errorexit "-sdefault64 is not supported with this compiler."
+        fi
+        ;;
+    -lhugetlbfs )
+        if [ ${HUGETLB8_POST_LINK_OPTS:+1} ] || [ ${HUGETLB2_POST_LINK_OPTS:+1} ] ; then
+           unset arglist[$argno]
+        else
+           arglist[$argno]="-Wl,--whole-archive,-lhugetlbfs,--no-whole-archive"
+           if [ "$seen_hugetlbfs" != "yes" ]; then
+                arglist[$argno]="-Wl,--whole-archive,-lhugetlbfs,--no-whole-archive"
+                seen_hugetlbfs=yes
+           fi
+        fi
+        ;;
+    -fopenmp | -openmp )
+        if [ "${PE_ENV}" == "GNU" ] || [ "${PE_ENV}" == "PATHSCALE" ] || [ "${PE_ENV}" == "INTEL" ] ; then
+           export FOPENMP_ENABLED=yes
+        fi
+        ;;
+    -mp* )
+        if [ "${PE_ENV}" == "PGI" ] && [ ${CRAYPE_COMPILE_TARGET} != "native" ] ; then
+         export FOPENMP_ENABLED=yes
+           if [ "$dynamic" != "yes" ] || [ "$XTPE_LINK_TYPE" == "static" ] ; then
+              compile_opts="$compile_opts -mp=nonuma"
+           fi
+        fi
+        ;;
+    -m32 )
+        if [ "${PE_ENV}" == "PGI" ] ; then
+           errorexit "PGI option -m32 is not supported."
+        fi
+        ;;
+    * )
+	found=1
+	;;
+    esac
+    ((argno++))
+done
+
+if [ "${PE_ENV}" == "CRAY" ] ; then
+
+##################################
+# Look at the cce command line using getopts.
+# Process getopts using function so that $@ is preserved
+####
+function process_getopts
+{
+
+default64_set=0
+real64_set=0
+
+## Use number of args until it's 0: lim=$#
+## Use getopts to check options, but must keep going even when a non-option is reached.
+##
+while (($#))
+do
+  OPTIND=1
+while getopts ":aA:Bb:cC:D:d:Ee:f:FgG:Hh:i:I:jJ:K:k:l:L:m:M:nN:o:O:p:P:qQ:r:R:s:S:t:Tu:U:vVwW:x:X:yY:zZ:" FLAG
+
+  do
+    case "$FLAG" in
+        h)
+            cpu_value=`echo ${OPTARG} | grep -c "cpu="`
+            if [ "$cpu_value" -ne 0 ] ; then
+               cpu_target=`echo ${OPTARG} | grep "cpu=" | sed -e "s/cpu=//g"`
+               if [ "$cpu_target" == "interlagos-cu" ] ; then
+                  export CRAY_CPU_TARGET=interlagos
+                  export CRAY_INTERLAGOS_CU=yes
+               elif [ "$cpu_target" == "abudhabi" ] ; then
+                  export CRAY_CPU_TARGET=interlagos
+                  export CRAY_ABUDHABI=yes
+               elif [ "$cpu_target" == "abudhabi-cu" ] ; then
+                  export CRAY_CPU_TARGET=interlagos
+                  export CRAY_ABUDHABI_CU=yes
+               else
+                  export CRAY_CPU_TARGET=$cpu_target
+               fi
+            fi
+            omp_value=`echo ${OPTARG} | grep -c "omp"`
+            if [ "$omp_value" -ne 0 ] ; then
+               export FOPENMP_ENABLED=yes
+            fi
+        ;;
+        l)
+            acml_set=`echo ${OPTARG} | grep -c "acml"`
+            if [ "$acml_set" -ne 0 ] ; then
+               export CRAY_ACML_USER=yes
+            fi
+        ;;
+        s)
+            default64_set=`echo ${OPTARG} | grep -c "default64"`
+            real64_set=`echo ${OPTARG} | grep -c "real64"`
+
+            if [ "$default64_set" -ne 0 ] ; then
+                export FTN_DEFAULT64=yes
+            fi
+            if [ "$real64_set" -ne 0 ] ; then
+                export CRAY_REAL64=yes
+            fi
+        ;;
+        *)
+        ;;
+    esac
+  done
+  shift $(($OPTIND - 1))
+
+  while (( $# )) && [ "${1#-}" = "$1" -o "$1" = "-" ]
+  # Process non-options and skip next thing in $@
+  # Treat long "-" as argument and let ld error out.
+  do
+    shift
+  done
+done
+
+}
+#
+#############################
+process_getopts "$@"
+fi
+
+if [ "${found}" == "0" ] && [ "$noarg_version" == "1" ] ; then
+       noarg_version=" -V"
+       target="native"
+elif [ "${found}" == "0" ] && [ "$help" != "yes" ] ; then
+       Usage
+fi
+
+#
+# Sort out the dynamic/static linking problem
+# We still set default as "static".
+#
+if [ "$dynamic" = "yes" ] && [ "$static" = "yes" ] ; then
+        errorexit "User cannot set both -dynamic and -static options."
+elif [ "$dynamic" = "yes" ] ; then
+        export XTPE_LINK_TYPE=dynamic
+elif [ "$static" = "yes" ] ; then
+        export XTPE_LINK_TYPE=static
+else
+        export XTPE_LINK_TYPE=${XTPE_LINK_TYPE:-static}
+fi
+
+if [ "$XTPE_LINK_TYPE" == "dynamic" ] ; then
+     case $PE_ENV in
+     PGI)
+        link_opts="-Bdynamic"
+     ;;
+     GNU)
+        link_opts=
+     ;;
+     CRAY)
+	if [ "$CRAY_SHARED" == "yes" ] ; then
+           link_opts=
+	else
+           link_opts="-hdynamic"
+	fi
+     ;;
+     PATHSCALE)
+        link_opts=      
+     ;;
+     INTEL)
+        link_opts="-lsvml -lintlc"
+     ;;
+     esac
+
+elif [ "$XTPE_LINK_TYPE" == "static" ] || [ ! ${XTPE_LINK_TYPE:+1} ] ; then
+     case $PE_ENV in
+     PGI)
+        link_opts="-Bstatic"
+     ;;
+     GNU)
+        link_opts="-static"
+     ;;
+     CRAY)
+        link_opts="-hstatic"
+     ;;
+     PATHSCALE)
+        link_opts="--static"
+     ;;
+     INTEL)
+        link_opts="-static"
+     ;;
+     esac
+else
+     export XTPE_LINK_TYPE=${XTPE_LINK_TYPE:-static}
+fi
+
+#Make sure GCC_VERSION has some value for this script.
+if [ "${GCC_VERSION}" == "" ] ; then
+        export GCC_VERSION=3
+fi
+
+if [ "$target" == "compute_node" ] || [ "$target" == "local_host" ] || [ "$target" == "petest" ] ; then
+
+	# This target supports CNL.
+        #
+        # Let's produce a target statement.
+        # Allow users to turn it on by setting XTPE_INFO_MESSAGE_ON.
+
+	if [ ${XTPE_INFO_MESSAGE_ON:+1} ] ; then
+              if [ "$target" == "compute_node" ] ; then
+		info "Compiling for compute nodes running CLE." >&2
+              else    
+                info "Compiling with CRAYPE_COMPILE_TARGET=$target." >&2
+              fi
+	fi
+
+        # We look at CRAY_CPU_TARGET after evaluating whether it's set by -hcpu= on cce commandline
+        # If it was set by cce commandline, then CRAY_CPU_TARGET was adjusted to interlagos from interlagos-cu 
+        # because there are no interlagos-cu library targets; we must use interlagos.
+
+        # For cpu=abudhabi we switch CRAY_CPU_TARGET to interlagos for library settings. Only cce has subtarget=abudhabi
+
+        if [ "$CRAY_CPU_TARGET" == "interlagos-cu" ] ; then
+
+           if [ "$PE_ENV" != "CRAY" ] ; then
+
+               if [ "${XTPE_INFO_MESSAGE_ON}" == "" ] ; then
+                  info "WARNING: interlagos-cu target only is recognized by cce compiler. Setting CRAY_CPU_TARGET=interlagos"
+               fi
+               export CRAY_CPU_TARGET=interlagos
+               export CRAY_INTERLAGOS_ENABLED=ON
+
+           else
+               export CRAY_INTERLAGOS_CU=yes
+               export CRAY_CPU_TARGET=interlagos
+           fi
+        fi
+
+        if [ "$CRAY_CPU_TARGET" == "abudhabi" ] ; then
+
+               export CRAY_ABUDHABI=yes
+               export CRAY_CPU_TARGET=interlagos
+
+               if [ "$PE_ENV" != "CRAY" ] ; then
+                  export CRAY_INTERLAGOS_ENABLED=ON
+               fi
+        fi
+
+        if [ "$CRAY_CPU_TARGET" == "abudhabi-cu" ] ; then
+
+           if [ "$PE_ENV" != "CRAY" ] ; then
+
+               if [ "${XTPE_INFO_MESSAGE_ON}" == "" ] ; then
+                  info "WARNING: abudhabi-cu target only is recognized by cce compiler. Setting CRAY_CPU_TARGET=interlagos"
+               fi
+               export CRAY_CPU_TARGET=interlagos
+               export CRAY_INTERLAGOS_ENABLED=ON
+
+           else
+               export CRAY_ABDUHABI_CU=yes
+               export CRAY_CPU_TARGET=interlagos
+           fi
+        fi
+
+	case $PE_ENV in
+
+        CRAY)
+                export XTPE_COMPILER=cray
+                compilerdriver="crayftn"
+                ;;
+
+        PGI)
+		export XTPE_COMPILER=pgi
+                compilerdriver="linux-f90"
+                ;;
+        GNU)
+                uver=`echo "$GCC_VERSION" | cut -d. -f1`
+                if [ "$uver" -lt 4 ]; then
+			errorexit "Pre-4.0 GCC versions do not support f90."
+                fi
+                uver=`echo ${GCC_VERSION}| cut -d. -f1-3 | sed -e "s/\.//g"`
+                if [ "${XTPE_BARCELONA_ENABLED}" == "ON" ] || [ "${XTPE_SHANGHAI_ENABLED}" == "ON" ] ; then
+                        if [ "$uver" == "420quadcore" ] || [ "$uver" -ge 430 ] ; then
+                        bam=
+                        elif [ ${XTPE_INFO_MESSAGE_ON:+1} ] ; then
+                                info "WARNING:  gcc/$GCC_VERSION does not support barcelona options." >&2
+                                info "Swap gcc/$GCC_VERSION for gcc/420quadcore or a post 4.3 gcc version." >&2
+                        fi
+                fi
+                if [ "$CRAY_CPU_TARGET" == "interlagos" ] ; then
+                   if [ "$uver" -ge 461 ] ; then
+                     compile_opts="$compile_opts -march=bdver1"
+                   else
+                     compile_opts="$compile_opts -march=amdfam10"
+                   fi
+                fi
+		export XTPE_COMPILER=gnu
+                compilerdriver="linux-f90"
+                ;;
+        PATHSCALE)
+		export XTPE_COMPILER=pathscale
+                compilerdriver="linux-f90"
+                ;;
+	INTEL)
+                export XTPE_COMPILER=intel
+                compilerdriver="linux-f90"
+                ;;
+        *)
+		errorexit "A PrgEnv-* modulefile must be loaded."
+        ;;
+	esac
+
+elif  [ "$target" == "native" ] || [ "$CRAY_SHARED" == "yes" ] ; then
+        # This target uses the host root environment.
+        #
+        # Let's produce a target statement.
+        # Allow users to turn it on by setting XTPE_INFO_MESSAGE_ON.
+
+        if [ "$help" == "yes" ] && [ "$PE_ENV" != "CRAY" ] ; then
+                    link_opts=
+        elif [ "$found" == "0" ] && [ "$noarg_version" == " -V" ] ; then
+                    link_opts=
+        fi
+
+        if [ ${XTPE_INFO_MESSAGE_ON:+1} ] ; then
+                info "Compiling with CRAYPE_COMPILE_TARGET=$target." >&2
+        fi
+
+        case $PE_ENV in
+        GNU)
+                compilerdriver=/opt/gcc/$GCC_VERSION/bin/gfortran
+        ;;
+        PATHSCALE)
+
+                ##
+                # Because pathscale bin/ installs without version, we need to
+                # call the compiler by version number.
+                ##
+
+                if [ ${PATHSCALE_VERSION:+1} ]; then
+                        compilerdriver=$PATHSCALE_PATH/bin/pathf90-${PATHSCALE_VERSION}
+                else
+                        compilerdriver=$PATHSCALE_PATH/bin/pathf90
+                fi
+        ;;
+        PGI)
+                compilerdriver="$PGI_PATH/linux86-64/$PGI_VERSION/bin/pgf90"
+        ;;
+
+        CRAY)
+                compilerdriver="crayftn -hcpu=x86-64"
+        ;;
+        INTEL)
+                inteluver=`echo ${INTEL_VERSION}|sed -e "s/\.//g"| cut -c1-2`
+                if [ "$inteluver" -ge 12 ] ; then
+                	compilerdriver=$INTEL_PATH/bin/intel64/ifort
+                elif [ "$inteluver" -ge 11 ] ; then
+                	compilerdriver=$INTEL_PATH/$INTEL_MAJOR_VERSION/$INTEL_MINOR_VERSION/bin/intel64/ifort
+		else
+                	compilerdriver=$INTEL_PATH/fce/$INTEL_VERSION/bin/ifort
+		fi
+                if [ ! -f $compilerdriver ] ; then
+                   errorexit "The intel ${INTEL_VERSION} on this system does not contain a Fortran compiler."
+                fi
+        ;;
+	*)
+	        errorexit "PE_ENV is not set. No PrgEnv-* modulefile is loaded."
+        ;;
+        esac
+else
+	errorexit "-target=${target} is not supported!"
+fi
+
+if [ "$target" == "native" ] || [ "$CRAY_SHARED" == "yes" ] ; then
+        exec $CRAY_PREPROCESSOR $CRAY_PREPROCESSOR_OPTS ${compilerdriver} $compile_opts $link_opts "${arglist[@]}"
+else
+        exec ${ASYNCPE_DIR}/bin/${compilerdriver} $compile_opts $link_opts "${arglist[@]}"
+fi
